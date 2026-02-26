@@ -1,0 +1,17 @@
+{
+  "name": "pulsecheck",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "services/*"
+  ],
+  "scripts": {
+    "dev:auth": "node services/auth/src/server.js",
+    "dev:monitoring": "node services/monitoring/src/server.js",
+    "dev:notification": "node services/notification/src/server.js",
+    "docker:up": "docker-compose up --build",
+    "docker:down": "docker-compose down",
+    "test:benchmark": "k6 run benchmarks/api_benchmark.js",
+    "test:benchmark:docker": "docker run --rm -i grafana/k6 run - <benchmarks/api_benchmark.js"
+  }
+}

@@ -1,0 +1,85 @@
+version: "3.8"
+
+services:
+  # ── Infrastructure ──
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      - pulsecheck
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - pulsecheck
+
+  # ── Application Services ──
+  auth:
+    build:
+      context: .
+      dockerfile: services/auth/Dockerfile
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=development
+      - MONGO_URI=mongodb://mongo:27017/pulsecheck
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=docker-dev-secret-change-in-prod
+      - AUTH_PORT=3001
+      - RATE_LIMIT_MAX=-1
+    depends_on:
+      - mongo
+      - redis
+    networks:
+      - pulsecheck
+
+  monitoring:
+    build:
+      context: .
+      dockerfile: services/monitoring/Dockerfile
+    ports:
+      - "3002:3002"
+    environment:
+      - NODE_ENV=development
+      - MONGO_URI=mongodb://mongo:27017/pulsecheck
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=docker-dev-secret-change-in-prod
+      - MONITORING_PORT=3002
+      - RATE_LIMIT_MAX=100000
+    depends_on:
+      - mongo
+      - redis
+    networks:
+      - pulsecheck
+
+  notification:
+    build:
+      context: .
+      dockerfile: services/notification/Dockerfile
+    ports:
+      - "3003:3003"
+    environment:
+      - NODE_ENV=development
+      - MONGO_URI=mongodb://mongo:27017/pulsecheck
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=docker-dev-secret-change-in-prod
+      - NOTIFICATION_PORT=3003
+      - SMTP_HOST=smtp.ethereal.email
+      - SMTP_PORT=587
+    depends_on:
+      - mongo
+      - redis
+    networks:
+      - pulsecheck
+
+volumes:
+  mongo-data:
+
+networks:
+  pulsecheck:
+    driver: bridge

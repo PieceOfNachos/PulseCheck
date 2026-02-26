@@ -1,0 +1,20 @@
+{
+  "name": "@pulsecheck/notification",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.2.0",
+    "@fastify/swagger": "^9.7.0",
+    "@fastify/swagger-ui": "^5.2.5",
+    "@pulsecheck/shared": "*",
+    "fastify": "^5.7.4",
+    "fastify-plugin": "^5.0.1",
+    "ioredis": "^5.4.2",
+    "mongoose": "^8.10.1",
+    "nodemailer": "^6.9.16"
+  }
+}
