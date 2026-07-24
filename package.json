@@ -9,9 +9,13 @@
     "dev:auth": "node services/auth/src/server.js",
     "dev:monitoring": "node services/monitoring/src/server.js",
     "dev:notification": "node services/notification/src/server.js",
+    "dev:web": "npm run dev --workspace=services/web",
     "docker:up": "docker-compose up --build",
     "docker:down": "docker-compose down",
     "test:benchmark": "k6 run benchmarks/api_benchmark.js",
     "test:benchmark:docker": "docker run --rm -i grafana/k6 run - <benchmarks/api_benchmark.js"
+  },
+  "devDependencies": {
+    "shadcn": "^4.14.0"
   }
 }

@@ -3,8 +3,12 @@ node_modules/
 
 # Environment
 .env
-.env.local
-.env.production
+.env.*
+!.env.example
+
+# Secrets
+*.pem
+*.key
 
 # Logs
 logs/
@@ -27,3 +31,11 @@ docker-compose.override.yml
 # Build output
 dist/
 build/
+
+# Vite (services/web, Phase 1)
+.vite/
+
+# Test coverage
+coverage/
+docs/ui
+.claude
