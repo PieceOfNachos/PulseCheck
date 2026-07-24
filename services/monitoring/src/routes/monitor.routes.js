@@ -65,7 +65,7 @@ async function monitorRoutes(fastify) {
         201: {
           type: "object",
           properties: {
-            monitor: { type: "object" },
+            monitor: { type: "object", additionalProperties: true },
           },
         },
       },
@@ -83,7 +83,10 @@ async function monitorRoutes(fastify) {
         200: {
           type: "object",
           properties: {
-            monitors: { type: "array", items: { type: "object" } },
+            monitors: {
+              type: "array",
+              items: { type: "object", additionalProperties: true },
+            },
           },
         },
       },
@@ -101,6 +104,18 @@ async function monitorRoutes(fastify) {
         type: "object",
         properties: {
           id: { type: "string", description: "Monitor ID" },
+        },
+      },
+      response: {
+        200: {
+          type: "object",
+          properties: {
+            monitor: { type: "object", additionalProperties: true },
+            recentChecks: {
+              type: "array",
+              items: { type: "object", additionalProperties: true },
+            },
+          },
         },
       },
     },

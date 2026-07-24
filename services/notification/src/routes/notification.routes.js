@@ -27,7 +27,10 @@ async function notificationRoutes(fastify) {
         200: {
           type: "object",
           properties: {
-            notifications: { type: "array", items: { type: "object" } },
+            notifications: {
+              type: "array",
+              items: { type: "object", additionalProperties: true },
+            },
             pagination: {
               type: "object",
               properties: {
