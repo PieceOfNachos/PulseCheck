@@ -1,0 +1,12 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+anthropic>=0.75
+langgraph>=0.6,<1.1
+langgraph-checkpoint-mongodb>=0.2
+pymongo>=4.9
+redis>=5.2
+qdrant-client[fastembed]>=1.12
+pydantic>=2.9
+pyjwt>=2.10
+httpx>=0.28
+pytest>=8.3
