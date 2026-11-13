@@ -6,6 +6,7 @@ import { ActivityIcon } from "lucide-react";
 
 const links = [
   { to: "/", label: "Dashboard", end: true },
+  { to: "/incidents", label: "Incidents", end: false },
   { to: "/notifications", label: "Notifications", end: false },
 ];
 

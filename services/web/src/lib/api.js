@@ -3,6 +3,7 @@ const BASE_URLS = {
   monitoring: import.meta.env.VITE_MONITORING_URL || "http://localhost:3002",
   notification:
     import.meta.env.VITE_NOTIFICATION_URL || "http://localhost:3003",
+  agent: import.meta.env.VITE_AGENT_URL || "http://localhost:3004",
 };
 
 const TOKEN_KEY = "pulsecheck_token";
@@ -41,7 +42,9 @@ async function request(base, path, options = {}) {
   const data = isJson ? await res.json() : null;
 
   if (!res.ok) {
-    throw new Error(data?.error || res.statusText || "Request failed");
+    // Node services send { error }, FastAPI (agent) sends { detail }
+    const detail = typeof data?.detail === "string" ? data.detail : null;
+    throw new Error(data?.error || detail || res.statusText || "Request failed");
   }
 
   return data;
@@ -61,3 +64,22 @@ function makeApi(base) {
 export const authApi = makeApi(BASE_URLS.auth);
 export const monitorApi = makeApi(BASE_URLS.monitoring);
 export const notifyApi = makeApi(BASE_URLS.notification);
+export const agentApi = makeApi(BASE_URLS.agent);
+
+export function listIncidents() {
+  return agentApi.get("/api/agent/incidents");
+}
+
+export function getIncident(id) {
+  return agentApi.get(`/api/agent/incidents/${encodeURIComponent(id)}`);
+}
+
+export function approveIncident(id, actions) {
+  return agentApi.post(`/api/agent/incidents/${encodeURIComponent(id)}/approve`, {
+    actions,
+  });
+}
+
+export function rejectIncident(id) {
+  return agentApi.post(`/api/agent/incidents/${encodeURIComponent(id)}/reject`, {});
+}
