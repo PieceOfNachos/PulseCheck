@@ -29,6 +29,10 @@ class Settings:
     token_budget: int = int(os.getenv("AGENT_TOKEN_BUDGET", "60000"))
     untrusted_max_chars: int = int(os.getenv("AGENT_UNTRUSTED_MAX_CHARS", "2048"))
     allow_private_targets: bool = os.getenv("AGENT_ALLOW_PRIVATE_TARGETS", "false") == "true"
+    # Runbooks are shared across tenants, so only these user ids may upload them.
+    runbook_admins: frozenset[str] = frozenset(
+        uid.strip() for uid in os.getenv("AGENT_RUNBOOK_ADMINS", "").split(",") if uid.strip()
+    )
 
 
 settings = Settings()

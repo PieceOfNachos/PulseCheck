@@ -3,7 +3,7 @@
 > Live status for [`PLAN.md`](./PLAN.md). Anyone picking this up: read **Module contracts**
 > below first — every module is built against them, so they're the integration spec.
 
-**Current phase:** Phases 1–3 in progress (parallel workstreams). Phase 4 after integration.
+**Current phase:** v1 complete. 149 tests pass; offline evals 100% on all metrics (see `services/agent/evals/RESULTS.md`).
 
 **Branch:** `feature/incident-agent` (off `feature/ui-phase2-3`)
 
@@ -13,10 +13,10 @@
 
 | # | Phase                  | Status | Notes |
 | - | ---------------------- | ------ | ----- |
-| 1 | Service core + graph   | 🟡     |       |
-| 2 | RAG                    | 🟡     |       |
-| 3 | Security & governance  | 🟡     |       |
-| 4 | Evals + delivery       | 🟡     | Docker/compose/web page in parallel; evals after integration |
+| 1 | Service core + graph   | ✅     | 36 graph/API tests |
+| 2 | RAG                    | ✅     | 7 runbooks → 42 chunks; expected runbook ranks #1 on all test queries |
+| 3 | Security & governance  | ✅     | 88 tests; threat model in [SECURITY.md](./SECURITY.md) |
+| 4 | Evals + delivery       | ✅     | Offline evals in CI; web build passes; Docker image not yet built locally |
 
 ## How to run (dev)
 
@@ -67,29 +67,37 @@ and settings in [`app/config.py`](../../services/agent/app/config.py). Everythin
 ## Task checklist
 
 ### Phase 1 — Service core + graph
-- [ ] `services/agent` scaffold (requirements, config, contracts) ✅ contracts/config done
-- [ ] `llm.py` (AnthropicLLM + FakeLLM)
-- [ ] `tools/probes.py`
-- [ ] `store.py` + in-memory collection
-- [ ] `graph.py` (all nodes, interrupt, IncidentAgent)
-- [ ] `main.py` (API, Redis subscriber, checkpointer)
-- [ ] Tests
+- [x] `services/agent` scaffold (requirements, config, contracts) ✅ contracts/config done
+- [x] `llm.py` (AnthropicLLM + FakeLLM)
+- [x] `tools/probes.py`
+- [x] `store.py` + in-memory collection
+- [x] `graph.py` (all nodes, interrupt, IncidentAgent)
+- [x] `main.py` (API, Redis subscriber, checkpointer)
+- [x] Tests
 
 ### Phase 2 — RAG
-- [ ] Chunker
-- [ ] KnowledgeBase (Qdrant + fastembed)
-- [ ] Seed runbooks
-- [ ] Tests
+- [x] Chunker
+- [x] KnowledgeBase (Qdrant + fastembed)
+- [x] Seed runbooks
+- [x] Tests
 
 ### Phase 3 — Security & governance
-- [ ] ssrf, untrusted, allowlist, budget, audit, auth
-- [ ] Tests
+- [x] ssrf, untrusted, allowlist, budget, audit, auth
+- [x] Tests
 
 ### Phase 4 — Evals + delivery
-- [ ] Dockerfile + compose (agent, qdrant)
-- [ ] Web: Incidents page with approve/reject
-- [ ] Evals + RESULTS.md
-- [ ] README section
+- [x] Dockerfile + compose (agent, qdrant)
+- [x] Web: Incidents page with approve/reject
+- [x] Evals + RESULTS.md
+- [x] README section
+
+## Next steps (not started)
+
+- [ ] `docker compose build agent` + end-to-end run against the live stack (Docker daemon was not available when v1 was finished).
+- [ ] Live eval run: `ANTHROPIC_API_KEY=... python -m evals.run_evals --live` and commit the updated `RESULTS.md`.
+- [ ] Pin the resolved IP in `RealProbes` to close the DNS-rebinding window (see SECURITY.md §4).
+- [ ] Per-tenant runbooks so uploads don't need an operator.
+- [ ] UI phases 4–7 (monitor detail, notifications page, polish, Docker for web) — see `docs/ui/`.
 
 ## Decision log
 
@@ -101,3 +109,5 @@ and settings in [`app/config.py`](../../services/agent/app/config.py). Everythin
 | 2026-11-13 | Probe tools take no arguments from the model; target URL is bound from the alert. Removes model-chosen SSRF entirely. |
 | 2026-11-13 | Local fastembed embeddings + Qdrant: no second API key, data stays local. |
 | 2026-11-13 | Evals run offline with a scripted model in CI; live mode when an API key is present. |
+| 2026-11-13 | Runbook uploads are operator-only (`AGENT_RUNBOOK_ADMINS`): the runbook collection is shared across tenants. |
+| 2026-11-13 | Exceeding the token budget fails the incident; exceeding the tool-call cap just ends investigation early. |

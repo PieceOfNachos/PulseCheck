@@ -26,7 +26,7 @@
 | LLM output (tool choices, diagnosis, action plan) | **Untrusted** | It has read attacker text; treat it like form input. |
 | User JWT | Verified per request | HS256, issued by the auth service, shared `JWT_SECRET`. |
 | Redis `alert:status-change` events | Internal | Published by the monitoring service on the private network. |
-| Runbooks (`services/agent/runbooks/`, future uploads) | Semi-trusted | Reviewed in git today; uploads would put text into prompts. |
+| Runbooks (`services/agent/runbooks/`, `POST /api/agent/runbooks`) | Semi-trusted | Seed runbooks are reviewed in git; uploads are restricted to operator ids in `AGENT_RUNBOOK_ADMINS` because every tenant retrieves from the same collection. |
 
 ## 3. Threats and mitigations
 
@@ -57,8 +57,11 @@
 - **Injection that stays within the allowlist.** A hostile body can still talk the model
   into proposing `pause_monitor` on the attacker's *own* monitor, or skew the diagnosis
   text. Impact is bounded to that user's data and still needs human approval.
-- **Runbook uploads.** Not in v1. If added, uploaded text must be wrapped with
-  `wrap_untrusted` at prompt time and size-limited at ingest, like probe output.
+- **Runbook uploads.** The runbook collection is shared by all tenants, so an upload could
+  plant text that other users' incidents retrieve. Uploads are therefore operator-only
+  (`AGENT_RUNBOOK_ADMINS`, empty by default = nobody) and capped at 50k chars. Per-tenant
+  runbooks (a `user_id` payload filter, as `past_incidents` already has) would allow
+  self-service uploads.
 - **Shared `JWT_SECRET`.** A leak lets anyone mint tokens for every service. Rotation is
   manual; there is no revocation list.
 - **Audit redaction is key-based.** A secret under an innocuous key (e.g. `note`) is only
