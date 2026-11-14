@@ -16,6 +16,15 @@ services:
     networks:
       - pulsecheck
 
+  qdrant:
+    image: qdrant/qdrant:v1.20.0
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    networks:
+      - pulsecheck
+
   # ── Application Services ──
   auth:
     build:
@@ -75,8 +84,31 @@ services:
     networks:
       - pulsecheck
 
+  # ── Incident Agent (Python) ──
+  agent:
+    build:
+      context: services/agent
+    ports:
+      - "3004:3004"
+    environment:
+      - MONGO_URI=mongodb://mongo:27017/pulsecheck
+      - MONGO_DB=pulsecheck
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=docker-dev-secret-change-in-prod
+      - QDRANT_URL=http://qdrant:6333
+      - AGENT_LLM=${AGENT_LLM:-anthropic}
+      - AGENT_MODEL=${AGENT_MODEL:-claude-opus-5-5}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    depends_on:
+      - mongo
+      - redis
+      - qdrant
+    networks:
+      - pulsecheck
+
 volumes:
   mongo-data:
+  qdrant-data:
 
 networks:
   pulsecheck:

@@ -5,6 +5,8 @@ import Layout from "@/components/Layout";
 import Login from "@/pages/Login";
 import Register from "@/pages/Register";
 import Dashboard from "@/pages/Dashboard";
+import Incidents from "@/pages/Incidents";
+import IncidentDetail from "@/pages/IncidentDetail";
 
 function Placeholder({ label }) {
   return (
@@ -36,6 +38,26 @@ function App() {
             <ProtectedRoute>
               <Layout>
                 <Placeholder label="Monitor detail — coming soon" />
+              </Layout>
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/incidents"
+          element={
+            <ProtectedRoute>
+              <Layout>
+                <Incidents />
+              </Layout>
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/incidents/:id"
+          element={
+            <ProtectedRoute>
+              <Layout>
+                <IncidentDetail />
               </Layout>
             </ProtectedRoute>
           }

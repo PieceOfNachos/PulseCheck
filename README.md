@@ -15,8 +15,57 @@ This is called **microservice architecture**. Instead of one giant `server.js` t
 | **Auth**         | 3001 | Sign up, log in, give out JWT tokens                             |
 | **Monitoring**   | 3002 | CRUD for monitors + the background loop that actually pings URLs |
 | **Notification** | 3003 | Listens for "API went down!" messages and sends emails           |
+| **Agent** (AI)   | 3004 | Investigates outages, diagnoses the cause, proposes a fix (Python) |
 
 Each one is its own mini Fastify app with its own `server.js`, routes, controllers, and models. They all share the same MongoDB database but they run independently — if the notification service crashes, the monitoring and auth services keep working fine.
+
+---
+
+## Incident Agent (AI)
+
+The email tells you *that* your API is down. The incident agent tries to tell you *why*. It's a fourth service (Python + FastAPI + LangGraph, port 3004) that listens on the same Redis channel as the notification service. When a monitor goes **DOWN** it re-probes the endpoint, checks DNS and TLS, reads the recent check history, looks up matching runbooks and similar past incidents in Qdrant (RAG), and writes a diagnosis with a confidence score and cited sources. Then it proposes a fix (only from a small allowlist: pause the monitor, escalate, or do nothing) and **stops and waits for you** to approve or reject it on the **Incidents** page. Nothing runs without a human clicking approve, and every step is written to an audit trail.
+
+```
+monitoring ──publish──► Redis "alert:status-change" ──► notification (email)
+                                     │
+                                     └──► agent service :3004 (Python)
+                                              │
+                         ┌────────────────────┴──────────────────────┐
+                         │            LangGraph incident graph        │
+                         │                                            │
+                         │  triage ─► investigator ─► researcher ─►   │
+                         │  (rules)   (tool loop)     (RAG/Qdrant)    │
+                         │                                            │
+                         │  ─► diagnoser ─► planner ─► ⏸ human_gate   │
+                         │     (structured)  (allowlisted)  interrupt │
+                         │                                    │       │
+                         │                     approve ◄──────┤       │
+                         │                     executor ─► reporter   │
+                         └────────────────────────────────────────────┘
+                                   │                    │
+                            Mongo: incidents,     Qdrant: runbooks,
+                            agent_audit,          past_incidents
+                            checkpoints
+```
+
+**Running it** — it's part of `docker compose`, along with a Qdrant container:
+
+```bash
+# With a real model (Claude)
+export ANTHROPIC_API_KEY=sk-ant-...
+docker compose up --build
+
+# Fully offline, no API key (scripted fake model — good for demos and CI)
+AGENT_LLM=fake docker compose up --build
+```
+
+Then take one of your monitored URLs down and open **Incidents** in the web app.
+
+More detail:
+
+- [`docs/agent/PLAN.md`](docs/agent/PLAN.md) — design, agent team, API, phases
+- [`docs/agent/SECURITY.md`](docs/agent/SECURITY.md) — prompt injection, SSRF, tenant isolation, cost limits
+- [`services/agent/evals/RESULTS.md`](services/agent/evals/RESULTS.md) — eval scenarios and scores
 
 ---
 
@@ -203,6 +252,7 @@ Once services are running, open these in your browser to see and test all endpoi
 - Auth: [http://localhost:3001/docs](http://localhost:3001/docs)
 - Monitoring: [http://localhost:3002/docs](http://localhost:3002/docs)
 - Notification: [http://localhost:3003/docs](http://localhost:3003/docs)
+- Agent: [http://localhost:3004/docs](http://localhost:3004/docs)
 
 ---
 
