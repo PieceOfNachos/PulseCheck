@@ -66,20 +66,25 @@ def _parse_ip(value: str) -> IPAddress | None:
         return None
 
 
-def assert_public_url(url: str, resolver: Resolver | None = None) -> None:
-    """Raise ``BlockedTargetError`` unless ``url`` is http(s) to a public host.
+def resolve_public(url: str, resolver: Resolver | None = None) -> tuple[str, int, list[str]]:
+    """Resolve ``url`` once and return ``(host, port, addresses)`` that passed the policy.
+
+    Callers must connect to one of the returned addresses rather than the hostname:
+    resolving again at connect time would let a zero-TTL record answer public here
+    and private for the real connection (DNS rebinding).
 
     Every address the hostname resolves to must be public, otherwise a DNS record
     with one public and one private A record could slip through. ``resolver`` has
     the ``socket.getaddrinfo`` signature and exists for tests.
     Re-raises ``socket.gaierror`` when the host does not resolve.
-    """
-    if settings.allow_private_targets:
-        return
 
+    With ``AGENT_ALLOW_PRIVATE_TARGETS`` the address policy is skipped, but the URL
+    is still parsed and resolved so callers can pin the connection the same way.
+    """
+    enforce = not settings.allow_private_targets
     try:
         parts = urlsplit(url)
-        port = parts.port
+        explicit_port = parts.port
     except ValueError as exc:
         raise BlockedTargetError(f"malformed URL: {exc}") from exc
 
@@ -90,22 +95,41 @@ def assert_public_url(url: str, resolver: Resolver | None = None) -> None:
     host = (parts.hostname or "").rstrip(".").lower()
     if not host:
         raise BlockedTargetError("URL has no host")
+    port = explicit_port or (443 if scheme == "https" else 80)
 
-    if host in BLOCKED_HOSTNAMES or host.endswith(BLOCKED_SUFFIXES):
+    if enforce and (host in BLOCKED_HOSTNAMES or host.endswith(BLOCKED_SUFFIXES)):
         raise BlockedTargetError(f"host {host!r} is internal")
 
     literal = _parse_ip(host)
     if literal is not None:
-        if is_blocked_ip(literal):
+        if enforce and is_blocked_ip(literal):
             raise BlockedTargetError(f"address {literal} is not public")
-        return
+        return host, port, [str(literal)]
 
     resolve = resolver or socket.getaddrinfo
-    infos = resolve(host, port or (443 if scheme == "https" else 80), type=socket.SOCK_STREAM)
+    infos = resolve(host, port, type=socket.SOCK_STREAM)
     if not infos:
         raise socket.gaierror(f"no addresses for {host}")
 
+    addresses: list[str] = []
     for info in infos:
-        ip = _parse_ip(str(info[4][0]))
-        if ip is None or is_blocked_ip(ip):
-            raise BlockedTargetError(f"host {host!r} resolves to non-public address {info[4][0]}")
+        raw = str(info[4][0])
+        ip = _parse_ip(raw)
+        if ip is None:
+            raise BlockedTargetError(f"host {host!r} resolves to unparseable address {raw}")
+        if enforce and is_blocked_ip(ip):
+            raise BlockedTargetError(f"host {host!r} resolves to non-public address {raw}")
+        if str(ip) not in addresses:
+            addresses.append(str(ip))
+    return host, port, addresses
+
+
+def assert_public_url(url: str, resolver: Resolver | None = None) -> None:
+    """Raise ``BlockedTargetError`` unless ``url`` is http(s) to a public host.
+
+    A yes/no check only. Anything that goes on to open a connection should use
+    ``resolve_public`` and connect to the address it returns.
+    """
+    if settings.allow_private_targets:
+        return
+    resolve_public(url, resolver)

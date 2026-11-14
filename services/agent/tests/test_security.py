@@ -175,6 +175,53 @@ def test_ssrf_bypass_when_private_targets_allowed(monkeypatch, strict_settings):
     assert_public_url("http://localhost/", resolver=must_not_resolve)
 
 
+def test_resolve_public_returns_validated_addresses_in_resolver_order():
+    resolver = fake_resolver("93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946", "93.184.216.34")
+    host, port, addresses = ssrf.resolve_public("https://Example.COM./health", resolver=resolver)
+    assert (host, port) == ("example.com", 443)
+    assert addresses == ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"]
+
+
+def test_resolve_public_default_and_explicit_ports():
+    resolver = fake_resolver("93.184.216.34")
+    assert ssrf.resolve_public("http://example.com/", resolver=resolver)[1] == 80
+    assert ssrf.resolve_public("https://example.com:8443/", resolver=resolver)[1] == 8443
+
+
+def test_resolve_public_literal_ip_skips_resolver():
+    assert ssrf.resolve_public("http://1.1.1.1:8080/x", resolver=must_not_resolve) == (
+        "1.1.1.1",
+        8080,
+        ["1.1.1.1"],
+    )
+
+
+def test_resolve_public_blocks_private_resolution():
+    with pytest.raises(BlockedTargetError):
+        ssrf.resolve_public("https://a.example/", resolver=fake_resolver("93.184.216.34", "10.0.0.5"))
+
+
+def test_resolve_public_resolves_once():
+    calls = []
+
+    def counting(host, port, *args, **kwargs):
+        calls.append(host)
+        return fake_resolver("93.184.216.34")(host, port)
+
+    ssrf.resolve_public("https://example.com/", resolver=counting)
+    assert calls == ["example.com"]
+
+
+def test_resolve_public_still_resolves_when_private_targets_allowed(monkeypatch, strict_settings):
+    monkeypatch.setattr(
+        ssrf, "settings", dataclasses.replace(strict_settings, allow_private_targets=True)
+    )
+    _, port, addresses = ssrf.resolve_public("http://localhost:3001/", resolver=fake_resolver("127.0.0.1"))
+    assert (port, addresses) == (3001, ["127.0.0.1"])
+    with pytest.raises(BlockedTargetError):
+        ssrf.resolve_public("ftp://localhost/", resolver=must_not_resolve)
+
+
 # ── untrusted content ────────────────────────────────────────────────────────
 
 

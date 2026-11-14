@@ -2,6 +2,10 @@
 
 Tools take no arguments from the model: the target is always the monitor URL carried
 by the alert, so the model can choose *which* check runs but never *where* it goes.
+
+Network probes resolve the host once through the SSRF guard and then connect to that
+validated address, never to the host name, so DNS cannot change the answer between
+the check and the connection.
 """
 
 from __future__ import annotations
@@ -11,21 +15,23 @@ import ssl
 import time
 from collections import Counter
 from datetime import datetime, timezone
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from urllib.parse import urlsplit
 
+import httpcore
 import httpx
 
 from app.contracts import AlertEvent, Evidence
-from app.security.ssrf import BlockedTargetError, assert_public_url
+from app.security.ssrf import BlockedTargetError, Resolver, resolve_public
 from app.security.untrusted import wrap_untrusted
 from app.store import to_object_id
 
 TOOL_NAMES: list[str] = ["probe_endpoint", "check_dns", "check_tls", "recent_checks"]
 
 TOOL_DESCRIPTIONS: dict[str, str] = {
-    "probe_endpoint": "Send one GET request to the monitored URL (redirects are not followed) "
-    "and report status code, latency, key headers and a truncated body.",
+    "probe_endpoint": "Send one request to the monitored URL with the monitor's own HTTP method "
+    "(redirects are not followed) and report the status code against the expected one, "
+    "latency, key headers and a truncated body.",
     "check_dns": "Resolve the monitored host name and list the addresses it resolves to.",
     "check_tls": "Open a TLS connection to the monitored host and report certificate validity, "
     "expiry date, days left and issuer, or the TLS error.",
@@ -37,6 +43,14 @@ DEFAULT_TIMEOUT_S = 5.0
 MAX_TIMEOUT_S = 15.0
 BODY_READ_BYTES = 16_384
 HEADER_SUBSET = ("server", "content-type", "location")
+USER_AGENT = "PulseCheck-Agent/1.0"
+DEFAULT_METHOD = "GET"
+DEFAULT_EXPECTED_STATUS = 200
+# The monitor schema also allows CONNECT, which makes no sense as a one-off probe.
+PROBE_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE"})
+BLOCKED_DETAIL = "target is not a public http(s) address"
+
+TransportFactory = Callable[[str], httpx.BaseTransport]
 
 
 class Probes(Protocol):
@@ -46,35 +60,116 @@ class Probes(Protocol):
     def recent_checks(self, alert: AlertEvent) -> Evidence: ...
 
 
-class RealProbes:
-    """Network and database backed probes. ``db`` maps collection names to collections."""
+class PinnedBackend(httpcore.NetworkBackend):
+    """Dials one fixed, already validated address whatever host the request names.
 
-    def __init__(self, db: Any, default_timeout: float = DEFAULT_TIMEOUT_S) -> None:
+    httpcore keeps using the URL's host name for the ``Host`` header, TLS SNI and
+    certificate verification; only the TCP destination changes.
+    """
+
+    def __init__(self, address: str, inner: httpcore.NetworkBackend | None = None) -> None:
+        self.address = address
+        self._inner = inner or httpcore.SyncBackend()
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.NetworkStream:
+        return self._inner.connect_tcp(
+            self.address,
+            port,
+            timeout=timeout,
+            local_address=local_address,
+            socket_options=socket_options,
+        )
+
+    def sleep(self, seconds: float) -> None:
+        self._inner.sleep(seconds)
+
+
+def pinned_transport(address: str) -> httpx.BaseTransport:
+    """An httpx transport whose every connection goes to ``address``.
+
+    httpx has no public hook for the network backend, so this replaces it on the
+    transport's connection pool. Connections pick the backend up from the pool when
+    they are created, so swapping it before the first request is enough.
+    """
+    transport = httpx.HTTPTransport(retries=0)
+    pool = getattr(transport, "_pool", None)
+    if not isinstance(pool, httpcore.ConnectionPool) or not hasattr(pool, "_network_backend"):
+        raise RuntimeError("unsupported httpx/httpcore version: cannot pin the target address")
+    pool._network_backend = PinnedBackend(address)
+    return transport
+
+
+def _blocked(tool: str, what: str) -> Evidence:
+    # The guard's own message names the internal address; keep it out of the evidence.
+    return Evidence(
+        tool=tool,
+        summary=f"Blocked by SSRF policy, {what}: {BLOCKED_DETAIL}.",
+        data={"blocked": True},
+    )
+
+
+class RealProbes:
+    """Network and database backed probes. ``db`` maps collection names to collections.
+
+    ``resolver`` (``socket.getaddrinfo`` signature) and ``transport_factory`` exist so
+    tests can run without touching the network.
+    """
+
+    def __init__(
+        self,
+        db: Any,
+        default_timeout: float = DEFAULT_TIMEOUT_S,
+        resolver: Resolver | None = None,
+        transport_factory: TransportFactory = pinned_transport,
+    ) -> None:
         self.db = db
         self.default_timeout = default_timeout
+        self.resolver = resolver
+        self.transport_factory = transport_factory
 
-    def _timeout(self, alert: AlertEvent) -> float:
-        """The monitor's own timeout, capped, falling back to the default."""
+    def _monitor(self, alert: AlertEvent) -> dict[str, Any]:
+        """The monitor document, or ``{}`` when it is missing or unreadable."""
         try:
             oid = to_object_id(alert.monitorId)
-            monitor = self.db["monitors"].find_one({"_id": oid}) if oid else None
-            ms = (monitor or {}).get("timeoutMs")
+            return (self.db["monitors"].find_one({"_id": oid}) if oid else None) or {}
+        except Exception:
+            return {}
+
+    def _timeout(self, monitor: dict[str, Any]) -> float:
+        """The monitor's own timeout, capped, falling back to the default."""
+        try:
+            ms = monitor.get("timeoutMs")
             if ms:
                 return min(float(ms) / 1000, MAX_TIMEOUT_S)
-        except Exception:
+        except (TypeError, ValueError):
             pass
         return self.default_timeout
+
+    @staticmethod
+    def _method(monitor: dict[str, Any]) -> str:
+        method = str(monitor.get("method") or DEFAULT_METHOD).strip().upper()
+        return method if method in PROBE_METHODS else DEFAULT_METHOD
+
+    @staticmethod
+    def _expected_status(monitor: dict[str, Any]) -> int:
+        try:
+            return int(monitor.get("expectedStatusCode") or DEFAULT_EXPECTED_STATUS)
+        except (TypeError, ValueError):
+            return DEFAULT_EXPECTED_STATUS
 
     def probe_endpoint(self, alert: AlertEvent) -> Evidence:
         url = alert.monitorUrl
         try:
-            assert_public_url(url)
-        except BlockedTargetError as exc:
-            return Evidence(
-                tool="probe_endpoint",
-                summary=f"Blocked by SSRF policy, request not sent: {exc}.",
-                data={"blocked": True, "reason": str(exc)},
-            )
+            _, _, addresses = resolve_public(url, self.resolver)
+        except BlockedTargetError:
+            return _blocked("probe_endpoint", "request not sent")
         except socket.gaierror as exc:
             return Evidence(
                 tool="probe_endpoint",
@@ -82,11 +177,19 @@ class RealProbes:
                 data={"error": "dns", "detail": str(exc)},
             )
 
-        timeout = self._timeout(alert)
+        monitor = self._monitor(alert)
+        timeout = self._timeout(monitor)
+        method = self._method(monitor)
+        expected = self._expected_status(monitor)
         start = time.perf_counter()
         try:
-            with httpx.Client(follow_redirects=False, timeout=timeout) as client:
-                with client.stream("GET", url, headers={"User-Agent": "PulseCheck-Agent/1.0"}) as r:
+            with httpx.Client(
+                transport=self.transport_factory(addresses[0]),
+                follow_redirects=False,
+                timeout=timeout,
+                trust_env=False,
+            ) as client:
+                with client.stream(method, url, headers={"User-Agent": USER_AGENT}) as r:
                     raw = b""
                     for chunk in r.iter_bytes():
                         raw += chunk
@@ -98,18 +201,21 @@ class RealProbes:
         except httpx.TimeoutException:
             return Evidence(
                 tool="probe_endpoint",
-                summary=f"Request timed out after {timeout:g}s.",
-                data={"error": "timeout", "timeout_s": timeout},
+                summary=f"{method} request timed out after {timeout:g}s.",
+                data={"error": "timeout", "timeout_s": timeout, "method": method},
             )
         except httpx.HTTPError as exc:
             return Evidence(
                 tool="probe_endpoint",
-                summary=f"Request failed: {type(exc).__name__}: {exc}",
-                data={"error": type(exc).__name__, "detail": str(exc)},
+                summary=f"{method} request failed: {type(exc).__name__}: {exc}",
+                data={"error": type(exc).__name__, "detail": str(exc), "method": method},
             )
 
         body = wrap_untrusted(raw.decode("utf-8", errors="replace"), source="probe_endpoint")
-        summary = f"HTTP {status} {reason} in {latency} ms"
+        summary = (
+            f"{method} returned HTTP {status} {reason} in {latency} ms "
+            f"(expected {expected}, got {status})"
+        )
         if "server" in headers:
             summary += f", server: {headers['server']}"
         if "location" in headers:
@@ -117,7 +223,14 @@ class RealProbes:
         return Evidence(
             tool="probe_endpoint",
             summary=f"{summary}, body: {body}",
-            data={"status_code": status, "latency_ms": latency, "headers": headers},
+            data={
+                "method": method,
+                "status_code": status,
+                "expected_status": expected,
+                "status_matches": status == expected,
+                "latency_ms": latency,
+                "headers": headers,
+            },
         )
 
     def check_dns(self, alert: AlertEvent) -> Evidence:
@@ -125,14 +238,21 @@ class RealProbes:
         if not host:
             return Evidence(tool="check_dns", summary="Monitor URL has no host name.")
         try:
-            infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+            _, _, addresses = resolve_public(alert.monitorUrl, self.resolver)
         except socket.gaierror as exc:
             return Evidence(
                 tool="check_dns",
                 summary=f"DNS resolution failed for {host}: {exc}",
                 data={"host": host, "error": str(exc)},
             )
-        addresses = sorted({str(info[4][0]) for info in infos})
+        except BlockedTargetError:
+            return Evidence(
+                tool="check_dns",
+                summary=f"{host} is internal or resolves to a non-public address; "
+                "blocked by policy, addresses not shown.",
+                data={"host": host, "blocked": True},
+            )
+        addresses = sorted(addresses)
         return Evidence(
             tool="check_dns",
             summary=f"{host} resolves to {', '.join(addresses)}",
@@ -144,20 +264,15 @@ class RealProbes:
         if parts.scheme != "https" or not parts.hostname:
             return Evidence(tool="check_tls", summary="Skipped: monitor URL is not https.")
         try:
-            assert_public_url(alert.monitorUrl)
-        except BlockedTargetError as exc:
-            return Evidence(
-                tool="check_tls",
-                summary=f"Blocked by SSRF policy, connection not opened: {exc}.",
-                data={"blocked": True, "reason": str(exc)},
-            )
+            host, port, addresses = resolve_public(alert.monitorUrl, self.resolver)
+        except BlockedTargetError:
+            return _blocked("check_tls", "connection not opened")
         except socket.gaierror as exc:
             return Evidence(tool="check_tls", summary=f"Host did not resolve ({exc}).")
 
-        host, port = parts.hostname, parts.port or 443
         context = ssl.create_default_context()
         try:
-            with socket.create_connection((host, port), timeout=DEFAULT_TIMEOUT_S) as sock:
+            with socket.create_connection((addresses[0], port), timeout=DEFAULT_TIMEOUT_S) as sock:
                 with context.wrap_socket(sock, server_hostname=host) as tls:
                     cert = tls.getpeercert() or {}
         except ssl.SSLCertVerificationError as exc:

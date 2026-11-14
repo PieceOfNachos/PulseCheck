@@ -36,7 +36,9 @@
 | **Fence breakout** (`</untrusted_content>` inside the body) | `wrap_untrusted` escapes every opening/closing `untrusted_content` tag, case- and whitespace-insensitive, so the payload stays inside one wrapper. |
 | **Model proposes a destructive or invented action** | `allowlist.filter_actions` keeps only `ALLOWED_ACTIONS` (`pause_monitor`, `escalate`, `no_action`) after normalising names; everything else goes to `rejected_actions` for the audit trail. There is no delete action to call. |
 | **Approval request tampered with** (client approves an action that was never proposed) | `allowlist.validate_approved` returns only names that were both proposed and allowlisted. The executor also re-checks monitor ownership against the incident's `userId`. |
-| **SSRF** via the monitor URL (`http://169.254.169.254/`, `http://redis:6379`, `http://10.0.0.5`) | `ssrf.assert_public_url` before every probe: http/https only; blocks `localhost`, `*.localhost`, `*.internal`, `*.local`, `metadata.google.internal`; rejects literal and *all* resolved addresses that are private, loopback, link-local, reserved, multicast, unspecified, CGNAT `100.64/10`, cloud metadata, or IPv4-mapped/6to4/Teredo forms of those. |
+| **SSRF** via the monitor URL (`http://169.254.169.254/`, `http://redis:6379`, `http://10.0.0.5`) | `ssrf.resolve_public` before every probe: http/https only; blocks `localhost`, `*.localhost`, `*.internal`, `*.local`, `metadata.google.internal`; rejects literal and *all* resolved addresses that are private, loopback, link-local, reserved, multicast, unspecified, CGNAT `100.64/10`, cloud metadata, or IPv4-mapped/6to4/Teredo forms of those. |
+| **DNS rebinding (TOCTOU)**: a zero-TTL record answers public for the check and private for the fetch | Each probe resolves the host exactly once via `ssrf.resolve_public` and connects to the first validated address. `probe_endpoint` uses an httpx transport whose httpcore network backend (`probes.PinnedBackend`) dials that pinned IP whatever host the request names, so the URL's host name still drives the `Host` header, TLS SNI and certificate verification. `check_tls` opens the socket to the pinned IP and passes the host name as `server_hostname`. Nothing resolves the name a second time. |
+| **Topology disclosure** through probe output (a monitor pointed at `intranet.example` revealing `10.0.0.5`) | `check_dns` applies the same policy: a host that is internal or resolves to any non-public address is reported as blocked, without the addresses or the guard's reason. Blocked `probe_endpoint` / `check_tls` results are equally generic. Public hosts still list their addresses; a resolution failure is still reported as a DNS finding. |
 | **Model-chosen SSRF targets** | Tools take no URL argument. Probes always hit the monitor's own URL from the alert. |
 | **Redirect to an internal host** | `RealProbes` runs httpx with redirects disabled; a `Location` header is reported as evidence, not followed. |
 | **Cross-tenant reads** | `auth.user_id_from_auth_header` derives `userId` from a verified JWT (`exp` required, `alg` pinned to HS256). Every repository and RAG query filters by that `userId`. |
@@ -46,14 +48,16 @@
 
 ## 4. Residual risks
 
-- **DNS rebinding (TOCTOU).** `assert_public_url` resolves the host, then `RealProbes`
-  resolves it *again* when httpx connects. A low-TTL record can answer public for the check
-  and private for the fetch. Mitigation idea: resolve once, connect to the pinned IP
-  (custom httpx transport) and send the original `Host` header / SNI. Until then, the
-  agent container should sit on a network with no route to sensitive internal services.
 - **Odd IP encodings.** `http://2130706433/` and `http://0x7f.1/` are not parsed as literals;
-  they rely on the resolver step. glibc resolves them to `127.0.0.1` and they are blocked;
-  other resolvers may refuse them (a DNS error, not a fetch). Pinning would close this too.
+  they go through the resolver like any host name. glibc resolves them to `127.0.0.1`, which
+  the policy blocks; other resolvers may refuse them (a DNS error, not a fetch). Because the
+  connection is pinned to the address the policy checked, the HTTP client never gets a chance
+  to interpret the encoding differently.
+- **Pinning uses the first address only.** If that address is unreachable the probe reports
+  a connection error instead of trying the next record, which can differ from what a browser
+  or the monitoring service sees for dual-stack hosts. Pinning also relies on replacing the
+  network backend on httpx's internal connection pool; `pinned_transport` refuses to run
+  (rather than silently resolving again) if a future httpx/httpcore changes that layout.
 - **Injection that stays within the allowlist.** A hostile body can still talk the model
   into proposing `pause_monitor` on the attacker's *own* monitor, or skew the diagnosis
   text. Impact is bounded to that user's data and still needs human approval.
