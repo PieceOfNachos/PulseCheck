@@ -17,7 +17,10 @@ async function buildServer() {
   });
 
   // ── Plugins ──
-  await fastify.register(cors, { origin: true });
+  await fastify.register(cors, {
+    origin: true,
+    methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"],
+  });
   // Disable rate limiting if max is set to -1
   if (config.rateLimitMax !== -1) {
     await fastify.register(rateLimit, {

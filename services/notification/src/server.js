@@ -18,7 +18,10 @@ async function buildServer() {
   });
 
   // ── Plugins ──
-  await fastify.register(cors, { origin: true });
+  await fastify.register(cors, {
+    origin: true,
+    methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"],
+  });
   await fastify.register(errorHandler);
   await fastify.register(authPlugin);
 

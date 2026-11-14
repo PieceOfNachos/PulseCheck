@@ -19,7 +19,39 @@ async function list(request, reply) {
   const monitors = await Monitor.find({ userId: request.user.id }).sort({
     createdAt: -1,
   });
-  return reply.code(200).send({ monitors });
+
+  const monitorIds = monitors.map((m) => m._id);
+  const latestChecks = monitorIds.length
+    ? await CheckResult.aggregate([
+        { $match: { monitorId: { $in: monitorIds } } },
+        { $sort: { checkedAt: -1 } },
+        {
+          $group: {
+            _id: "$monitorId",
+            status: { $first: "$status" },
+            statusCode: { $first: "$statusCode" },
+            latencyMs: { $first: "$latencyMs" },
+            checkedAt: { $first: "$checkedAt" },
+          },
+        },
+      ])
+    : [];
+  const latestByMonitor = new Map(
+    latestChecks.map((c) => [String(c._id), c]),
+  );
+
+  const enriched = monitors.map((m) => {
+    const latest = latestByMonitor.get(String(m._id));
+    return {
+      ...m.toJSON(),
+      lastStatus: latest?.status ?? null,
+      lastStatusCode: latest?.statusCode ?? null,
+      lastLatencyMs: latest?.latencyMs ?? null,
+      lastCheckedAt: latest?.checkedAt ?? null,
+    };
+  });
+
+  return reply.code(200).send({ monitors: enriched });
 }
 
 /**

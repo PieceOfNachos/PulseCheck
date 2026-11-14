@@ -26,7 +26,8 @@ function dispatchUnauthorized() {
 
 async function request(base, path, options = {}) {
   const token = getToken();
-  const headers = { "Content-Type": "application/json", ...options.headers };
+  const headers = { ...options.headers };
+  if (options.body) headers["Content-Type"] = "application/json";
   if (token) headers.Authorization = `Bearer ${token}`;
 
   const res = await fetch(`${base}${path}`, { ...options, headers });
