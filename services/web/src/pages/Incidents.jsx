@@ -5,6 +5,7 @@ import {
   categoryLabel,
   formatConfidence,
   formatTime,
+  isAutoRecovered,
   unwrapList,
 } from "@/lib/incidents";
 import {
@@ -18,7 +19,7 @@ import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import IncidentStatusBadge from "@/components/IncidentStatusBadge";
 import { cn } from "@/lib/utils";
-import { BookOpenIcon, BotIcon } from "lucide-react";
+import { BookOpenIcon, BotIcon, RotateCcwIcon } from "lucide-react";
 
 const POLL_INTERVAL_MS = 15_000;
 
@@ -83,6 +84,12 @@ function IncidentRow({ incident }) {
             {incident.status === "FAILED"
               ? incident.error || "The investigation failed before a diagnosis was made."
               : "Gathering evidence…"}
+          </p>
+        )}
+        {isAutoRecovered(incident) && (
+          <p className="flex items-center gap-1.5 text-sm text-emerald-600 dark:text-emerald-400">
+            <RotateCcwIcon className="size-3.5 shrink-0" />
+            Auto-closed: monitor recovered before approval — no actions taken
           </p>
         )}
         <div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">

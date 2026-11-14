@@ -7,6 +7,8 @@ import {
   categoryLabel,
   formatConfidence,
   formatTime,
+  formatTokens,
+  isAutoRecovered,
   unwrapIncident,
 } from "@/lib/incidents";
 import {
@@ -40,14 +42,42 @@ import {
   ChevronDownIcon,
   CircleCheckIcon,
   CircleXIcon,
+  CpuIcon,
+  RotateCcwIcon,
   SearchIcon,
+  ShieldCheckIcon,
   ShieldXIcon,
   TriangleAlertIcon,
+  UserCheckIcon,
   XIcon,
 } from "lucide-react";
 
 const POLL_INTERVAL_MS = 15_000;
-const AUDIT_HIDDEN_KEYS = new Set(["_id", "id", "incident_id", "user_id", "event", "at"]);
+// Envelope fields of an audit entry; the interesting payload lives in entry.data.
+const AUDIT_HIDDEN_KEYS = new Set([
+  "_id",
+  "id",
+  "incident_id",
+  "user_id",
+  "event",
+  "at",
+  "seq",
+  "data",
+]);
+const AUDIT_VALUE_MAX = 80;
+const AUDIT_KEY_LABELS = {
+  duration_ms: "duration",
+  tokens: "tokens",
+  tokens_used: "tokens",
+};
+
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isLowConfidenceReason(reason) {
+  return typeof reason === "string" && reason.trim().toLowerCase().startsWith("low confidence");
+}
 
 function Section({ title, description, action, children }) {
   return (
@@ -86,8 +116,56 @@ function DetailSkeleton() {
   );
 }
 
+function VerificationNote({ verification }) {
+  if (!isPlainObject(verification)) return null;
+
+  const dropped = Array.isArray(verification.dropped_citations)
+    ? verification.dropped_citations.filter(Boolean)
+    : [];
+  const grounded = verification.grounded === true && dropped.length === 0;
+  const ungrounded = dropped.length > 0 || verification.grounded === false;
+
+  return (
+    <>
+      {grounded && (
+        <p className="flex items-center gap-1.5 text-sm text-emerald-600 dark:text-emerald-400">
+          <ShieldCheckIcon className="size-4 shrink-0" /> Grounded in runbooks
+        </p>
+      )}
+      {ungrounded && (
+        <div className="flex flex-col gap-1.5">
+          <p className="flex items-center gap-1.5 text-sm text-amber-600 dark:text-amber-400">
+            <TriangleAlertIcon className="size-4 shrink-0" />
+            {dropped.length > 0 ? "Ungrounded citations removed" : "Not grounded in runbooks"}
+          </p>
+          {dropped.length > 0 && (
+            <div className="flex flex-wrap gap-2 pl-5.5">
+              {dropped.map((source) => (
+                <Badge
+                  key={source}
+                  variant="outline"
+                  className="border-amber-500/40 text-muted-foreground line-through"
+                >
+                  {String(source)}
+                </Badge>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+      {verification.low_confidence === true && (
+        <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-700 dark:text-amber-400">
+          <TriangleAlertIcon className="mt-0.5 size-4 shrink-0" />
+          Low confidence — destructive actions held back
+        </div>
+      )}
+    </>
+  );
+}
+
 function DiagnosisSection({ incident }) {
   const diagnosis = incident.diagnosis;
+  const verification = incident.verification ?? diagnosis?.verification;
   const category = categoryLabel(incident);
   const confidence = formatConfidence(diagnosis?.confidence);
 
@@ -133,6 +211,7 @@ function DiagnosisSection({ incident }) {
               ))}
             </div>
           )}
+          <VerificationNote verification={verification} />
         </>
       )}
     </Section>
@@ -188,6 +267,29 @@ function RunbooksSection({ retrieved }) {
         </ul>
       )}
     </Section>
+  );
+}
+
+function DecisionLine({ incident }) {
+  const decision = incident.decision;
+
+  if (isAutoRecovered(incident)) {
+    return (
+      <p className="flex items-center gap-1.5 text-sm text-emerald-600 dark:text-emerald-400">
+        <RotateCcwIcon className="size-4 shrink-0" />
+        Auto-closed: monitor recovered before approval — no actions taken
+      </p>
+    );
+  }
+
+  if (!decision?.approver) return null;
+
+  return (
+    <p className="flex items-center gap-1.5 text-sm text-muted-foreground">
+      <UserCheckIcon className="size-4 shrink-0" />
+      {decision.approved ? "Approved" : "Rejected"} by{" "}
+      <span className="truncate font-mono text-xs">{decision.approver}</span>
+    </p>
   );
 }
 
@@ -298,16 +400,29 @@ function ActionsSection({ incident, onRefresh }) {
         </ul>
       )}
 
+      {incident.decision && <DecisionLine incident={incident} />}
+
       {blocked.length > 0 && (
-        <div className="flex flex-col gap-2 rounded-lg border border-dashed border-border p-3 opacity-70">
+        <div className="flex flex-col gap-2 rounded-lg border border-dashed border-border p-3">
           <p className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground uppercase">
             <ShieldXIcon className="size-3.5" /> Blocked by policy
           </p>
-          <ul className="flex flex-col gap-1">
+          <ul className="flex flex-col gap-1.5">
             {blocked.map((item, i) => (
-              <li key={`${item.action}-${i}`} className="text-sm text-muted-foreground">
-                <span className="font-mono line-through">{item.action}</span>
-                {item.reason && <> — {item.reason}</>}
+              <li
+                key={`${item.action}-${i}`}
+                className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground"
+              >
+                <span className="font-mono line-through opacity-70">{item.action}</span>
+                {isLowConfidenceReason(item.reason) && (
+                  <Badge
+                    variant="outline"
+                    className="border-amber-500/40 bg-amber-500/15 text-amber-600 dark:text-amber-400"
+                  >
+                    Low confidence
+                  </Badge>
+                )}
+                {item.reason && <span>{item.reason}</span>}
               </li>
             ))}
           </ul>
@@ -390,12 +505,51 @@ function ResultsSection({ results }) {
   );
 }
 
-function auditExtras(entry) {
-  return Object.entries(entry)
-    .filter(([key, value]) => !AUDIT_HIDDEN_KEYS.has(key) && value != null && value !== "")
+function stringifyCompact(value) {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function formatAuditValue(key, value) {
+  if (key === "duration_ms" && typeof value === "number") {
+    return `${Math.round(value).toLocaleString()} ms`;
+  }
+  if ((key === "tokens" || key === "tokens_used") && typeof value === "number") {
+    return value.toLocaleString();
+  }
+  if (key === "tool" && isPlainObject(value)) {
+    return String(value.name ?? value.tool ?? stringifyCompact(value));
+  }
+  if (Array.isArray(value)) {
+    return value.every((v) => v === null || typeof v !== "object")
+      ? value.join(", ")
+      : stringifyCompact(value);
+  }
+  if (isPlainObject(value)) return stringifyCompact(value);
+  return String(value);
+}
+
+// Entries are {incident_id, user_id, event, at, seq, data}; older rows may be flat.
+function auditFields(entry) {
+  const payload = isPlainObject(entry.data)
+    ? entry.data
+    : Object.fromEntries(Object.entries(entry).filter(([key]) => !AUDIT_HIDDEN_KEYS.has(key)));
+
+  return Object.entries(payload)
+    .filter(([, value]) => value != null && value !== "" && !(Array.isArray(value) && value.length === 0))
     .map(([key, value]) => {
-      const text = typeof value === "object" ? JSON.stringify(value) : String(value);
-      return `${key}: ${text.length > 120 ? `${text.slice(0, 120)}…` : text}`;
+      const full = formatAuditValue(key, value);
+      const short =
+        full.length > AUDIT_VALUE_MAX ? `${full.slice(0, AUDIT_VALUE_MAX)}…` : full;
+      return {
+        key,
+        label: AUDIT_KEY_LABELS[key] || key,
+        value: short,
+        title: full,
+      };
     });
 }
 
@@ -426,19 +580,31 @@ function AuditTrail({ audit }) {
         <CardContent>
           <ol className="flex flex-col divide-y divide-border">
             {audit.map((entry, i) => {
-              const extras = auditExtras(entry);
+              const fields = auditFields(entry);
               return (
-                <li key={i} className="flex flex-col gap-0.5 py-2 first:pt-0 last:pb-0">
+                <li
+                  key={entry.seq ?? i}
+                  className="flex flex-col gap-1.5 py-2 first:pt-0 last:pb-0"
+                >
                   <div className="flex items-center justify-between gap-3">
                     <span className="font-mono text-sm">{entry.event}</span>
                     <span className="shrink-0 text-xs text-muted-foreground">
                       {formatTime(entry.at)}
                     </span>
                   </div>
-                  {extras.length > 0 && (
-                    <p className="font-mono text-xs break-all text-muted-foreground">
-                      {extras.join(" · ")}
-                    </p>
+                  {fields.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5">
+                      {fields.map((field) => (
+                        <span
+                          key={field.key}
+                          title={field.title}
+                          className="inline-flex max-w-full items-center gap-1 rounded-md border border-border bg-muted/40 px-1.5 py-0.5 font-mono text-xs"
+                        >
+                          <span className="shrink-0 text-muted-foreground">{field.label}:</span>
+                          <span className="truncate">{field.value}</span>
+                        </span>
+                      ))}
+                    </div>
                   )}
                 </li>
               );
@@ -454,6 +620,7 @@ export default function IncidentDetail() {
   const { id } = useParams();
   const [incident, setIncident] = useState(null);
   const [error, setError] = useState("");
+  const tokens = formatTokens(incident?.tokens_used);
 
   const fetchIncident = useCallback(
     async ({ silent = false } = {}) => {
@@ -512,7 +679,14 @@ export default function IncidentDetail() {
                 {formatTime(incident.updatedAt)}
               </p>
             </div>
-            <IncidentStatusBadge status={incident.status} />
+            <div className="flex flex-col items-end gap-1.5">
+              <IncidentStatusBadge status={incident.status} />
+              {tokens && (
+                <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                  <CpuIcon className="size-3.5" /> Model usage: {tokens} tokens
+                </span>
+              )}
+            </div>
           </div>
 
           {incident.error && (

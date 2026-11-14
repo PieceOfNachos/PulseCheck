@@ -52,3 +52,14 @@ export function unwrapList(data) {
 export function unwrapIncident(data) {
   return data?.incident || data;
 }
+
+export const AUTO_RECOVERY_APPROVER = "system:auto-recovery";
+
+export function isAutoRecovered(incident) {
+  return incident?.decision?.approver === AUTO_RECOVERY_APPROVER;
+}
+
+export function formatTokens(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  return value.toLocaleString();
+}
