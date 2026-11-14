@@ -3,7 +3,7 @@
 > Live status for [`PLAN.md`](./PLAN.md). Anyone picking this up: read **Module contracts**
 > below first — every module is built against them, so they're the integration spec.
 
-**Current phase:** v1 complete. 149 tests pass; offline evals 100% on all metrics (see `services/agent/evals/RESULTS.md`).
+**Current phase:** v1 + hardening pass complete. 184 tests pass; offline evals 100% on all metrics; end-to-end verified on Docker.
 
 **Branch:** `feature/incident-agent` (off `feature/ui-phase2-3`)
 
@@ -16,7 +16,7 @@
 | 1 | Service core + graph   | ✅     | 36 graph/API tests |
 | 2 | RAG                    | ✅     | 7 runbooks → 42 chunks; expected runbook ranks #1 on all test queries |
 | 3 | Security & governance  | ✅     | 88 tests; threat model in [SECURITY.md](./SECURITY.md) |
-| 4 | Evals + delivery       | ✅     | Offline evals in CI; web build passes; Docker image not yet built locally |
+| 4 | Evals + delivery       | ✅     | Offline evals in CI; web build passes; e2e smoke passes on docker compose |
 
 ## How to run (dev)
 
@@ -91,11 +91,27 @@ and settings in [`app/config.py`](../../services/agent/app/config.py). Everythin
 - [x] Evals + RESULTS.md
 - [x] README section
 
+## Hardening pass (2026-11-13)
+
+Code review → fixes, all verified:
+
+- [x] DNS rebinding: probes resolve once and connect to the pinned, validated IP (Host/SNI preserved).
+- [x] `check_dns` no longer reveals internal addresses; blocked evidence never names the private IP.
+- [x] Probes use the monitor's own method and expected status code.
+- [x] Failure path no longer overwrites persisted progress with a stale snapshot.
+- [x] Incidents interrupted by a restart are swept to FAILED at boot.
+- [x] RECOVERED alerts auto-close pending incidents (`system:auto-recovery`), so a healthy monitor can't be paused later.
+- [x] Bounded striped locks; budget counters carried on `BudgetExceeded`.
+- [x] **New: verifier node** — drops citations that weren't retrieved, halves confidence when ungrounded, and holds back `pause_monitor` below `AGENT_MIN_ACTION_CONFIDENCE`.
+- [x] Qdrant server upgraded to 1.20 to match the client.
+- [x] **End-to-end verified on the live compose stack** (`services/agent/scripts/e2e_smoke.py`): DOWN alert via Redis → incident awaiting approval with grounded diagnosis → cross-tenant 404 → approve → monitor actually paused in the monitoring service → RECOVERED auto-closes a second incident.
+- Tests: 184 passing; offline evals 100% on all metrics across 11 scenarios.
+
 ## Next steps (not started)
 
-- [ ] `docker compose build agent` + end-to-end run against the live stack (Docker daemon was not available when v1 was finished).
 - [ ] Live eval run: `ANTHROPIC_API_KEY=... python -m evals.run_evals --live` and commit the updated `RESULTS.md`.
-- [ ] Pin the resolved IP in `RealProbes` to close the DNS-rebinding window (see SECURITY.md §4).
+- [ ] Retrieval diversity: top-3 can return three chunks of the same runbook; cap chunks per source (or MMR) so the diagnoser sees alternatives.
+- [ ] Multi-replica safety: `fail_interrupted()` at boot assumes a single agent replica; use a lease/heartbeat per incident before scaling out.
 - [ ] Per-tenant runbooks so uploads don't need an operator.
 - [ ] UI phases 4–7 (monitor detail, notifications page, polish, Docker for web) — see `docs/ui/`.
 

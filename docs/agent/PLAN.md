@@ -46,11 +46,12 @@ monitoring ──publish──► Redis "alert:status-change" ──► notifica
                          │  triage ─► investigator ─► researcher ─►   │
                          │  (rules)   (tool loop)     (RAG/Qdrant)    │
                          │                                            │
-                         │  ─► diagnoser ─► planner ─► ⏸ human_gate   │
-                         │     (structured)  (allowlisted)  interrupt │
-                         │                                    │       │
-                         │                     approve ◄──────┤       │
-                         │                     executor ─► reporter   │
+                         │  ─► diagnoser ─► verifier ─► planner ─►    │
+                         │   (structured)  (grounding)  (allowlisted) │
+                         │                                            │
+                         │  ─► ⏸ human_gate ─► approve ─► executor    │
+                         │      interrupt                    │        │
+                         │                               reporter     │
                          └────────────────────────────────────────────┘
                                    │                    │
                             Mongo: incidents,     Qdrant: runbooks,
@@ -66,6 +67,7 @@ monitoring ──publish──► Redis "alert:status-change" ──► notifica
 | `investigator` | LLM + tools     | Bounded ReAct loop (max 4 tool calls): `probe_endpoint`, `check_dns`, `check_tls`, `recent_checks`. |
 | `researcher`   | Retrieval       | Query Qdrant for top-k runbook chunks and similar resolved incidents. |
 | `diagnoser`    | LLM, structured | Output `{category, root_cause, confidence, evidence[], cited_sources[]}` (Pydantic). |
+| `verifier`     | Code (no LLM)   | Groundedness check: drop citations that were not retrieved, halve confidence if none remain; below `AGENT_MIN_ACTION_CONFIDENCE` (0.5) the planner may only propose `escalate` / `no_action`. |
 | `planner`      | LLM, constrained| Propose actions **only** from the allowlist below, with a reason for each. |
 | `human_gate`   | `interrupt()`   | Graph pauses; incident status = `AWAITING_APPROVAL`. Resumed by the approve/reject API. |
 | `executor`     | Code            | Run approved actions only; re-check the allowlist and ownership. |

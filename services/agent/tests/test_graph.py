@@ -9,10 +9,31 @@ from bson import ObjectId
 from langgraph.checkpoint.memory import MemorySaver
 
 from app.config import settings
-from app.contracts import ApprovalDecision, Category
-from app.graph import IncidentAgent, IncidentNotFound, InvalidIncidentState, triage
+from app.contracts import (
+    AUTO_RECOVERY_APPROVER,
+    ActionPlan,
+    ApprovalDecision,
+    Category,
+    ProposedAction,
+)
+from app.graph import (
+    INTERRUPTED_ERROR,
+    LOCK_STRIPES,
+    IncidentAgent,
+    IncidentNotFound,
+    InvalidIncidentState,
+    triage,
+)
 from app.llm import FakeLLM
-from tests.agent_fakes import OTHER_USER_ID, USER_ID, CannedProbes, make_alert, make_harness
+from app.store import IncidentRepo, InMemoryCollection
+from tests.agent_fakes import (
+    MONITOR_ID,
+    OTHER_USER_ID,
+    USER_ID,
+    CannedProbes,
+    make_alert,
+    make_harness,
+)
 
 DNS_ALERT = {"statusCode": None, "errorMessage": "ENOTFOUND"}
 INJECTION = (
@@ -187,7 +208,7 @@ class GreedyLLM(FakeLLM):
 
 
 def test_budget_caps_tool_calls(monkeypatch):
-    monkeypatch.setattr("app.graph.settings", dataclasses.replace(settings, max_tool_calls=2))
+    monkeypatch.setattr("app.security.budget.settings", dataclasses.replace(settings, max_tool_calls=2))
     h = make_harness(llm=GreedyLLM())
     incident = agent_for(h).start(make_alert())
 
@@ -199,12 +220,13 @@ def test_budget_caps_tool_calls(monkeypatch):
 
 
 def test_token_budget_exceeded_fails_incident(monkeypatch):
-    monkeypatch.setattr("app.graph.settings", dataclasses.replace(settings, token_budget=200))
+    monkeypatch.setattr("app.security.budget.settings", dataclasses.replace(settings, token_budget=200))
     h = make_harness()
     incident = agent_for(h).start(make_alert())
 
     assert incident["status"] == "FAILED"
     assert "token budget" in incident["error"]
+    assert incident["tokens_used"] > 200  # spent tokens survive the failed node
     assert "error" in events(h, incident["id"])
 
 
@@ -229,3 +251,213 @@ def test_incident_ids_are_not_shared_across_users():
     hijack = make_alert(alertEventId=alert.alertEventId, userId=str(ObjectId()))
     assert agent.start(hijack) == {}
     assert h.deps.incidents.get(alert.alertEventId, USER_ID)["userId"] == USER_ID
+
+
+# ── Crash recovery ────────────────────────────────────────────────────────────
+
+
+class CrashingRepo(IncidentRepo):
+    """Raises on any upsert matching ``crash_when``, like Mongo dropping mid-run."""
+
+    def __init__(self, collection, crash_when) -> None:
+        super().__init__(collection)
+        self.crash_when = crash_when
+
+    def upsert(self, doc: dict) -> None:
+        if self.crash_when(doc):
+            raise RuntimeError("mongo went away")
+        super().upsert(doc)
+
+
+def with_crashing_repo(harness, crash_when) -> CrashingRepo:
+    repo = CrashingRepo(InMemoryCollection(), crash_when)
+    harness.deps = dataclasses.replace(harness.deps, incidents=repo)
+    return repo
+
+
+def test_crash_during_start_keeps_progress():
+    h = make_harness()
+    with_crashing_repo(h, lambda doc: bool(doc.get("proposed_actions")))
+    incident = agent_for(h).start(make_alert())
+
+    assert incident["status"] == "FAILED"
+    assert incident["error"] == "graph: mongo went away"
+    assert len(incident["evidence"]) == 2
+    assert incident["diagnosis"]["category"] == "server_error"
+    assert incident["verification"]["grounded"] is True
+
+
+def test_crash_after_executor_keeps_results():
+    h = make_harness()
+    repo = with_crashing_repo(h, lambda doc: False)
+    agent = agent_for(h)
+    incident = agent.start(make_alert(**DNS_ALERT))
+    repo.crash_when = lambda doc: doc.get("status") == "RESOLVED"
+
+    done = approve(agent, incident, ["pause_monitor"])
+
+    assert done["status"] == "FAILED"
+    assert done["results"] == [{"action": "pause_monitor", "ok": True, "detail": "Monitor paused."}]
+    assert done["decision"]["approved"] is True
+    assert h.monitors.docs[0]["active"] is False
+
+
+def test_failure_never_reopens_a_finished_incident():
+    h = make_harness()
+    incident = agent_for(h).start(make_alert(statusCode=None, errorMessage="weird"))
+    assert incident["status"] == "RESOLVED"
+
+    assert h.deps.incidents.mark_failed(incident["id"], "late crash") is False
+    assert h.deps.incidents.get(incident["id"], USER_ID)["status"] == "RESOLVED"
+
+
+def test_interrupted_investigations_are_failed():
+    h = make_harness()
+    agent = agent_for(h)
+    stuck = make_alert()
+    h.deps.incidents.upsert(
+        {
+            "id": stuck.alertEventId,
+            "userId": USER_ID,
+            "monitorId": stuck.monitorId,
+            "status": "INVESTIGATING",
+            "evidence": [{"tool": "check_dns", "summary": "ok"}],
+        }
+    )
+    waiting = agent.start(make_alert())
+
+    assert agent.fail_interrupted() == [stuck.alertEventId]
+
+    failed = h.deps.incidents.get(stuck.alertEventId, USER_ID)
+    assert failed["status"] == "FAILED"
+    assert failed["error"] == INTERRUPTED_ERROR
+    assert failed["evidence"] == [{"tool": "check_dns", "summary": "ok"}]
+    assert "error" in events(h, stuck.alertEventId)
+    assert h.deps.incidents.get(waiting["id"], USER_ID)["status"] == "AWAITING_APPROVAL"
+    assert agent.fail_interrupted(before="2000-01-01T00:00:00+00:00") == []
+
+
+def test_incident_locks_are_bounded():
+    agent = agent_for(make_harness())
+    locks = {id(agent._lock(str(ObjectId()))) for _ in range(500)}
+    assert len(locks) <= LOCK_STRIPES
+    assert agent._lock("same") is agent._lock("same")
+
+
+# ── Auto-close on recovery ────────────────────────────────────────────────────
+
+
+def test_recovery_closes_pending_incident_without_acting():
+    h = make_harness()
+    agent = agent_for(h)
+    incident = agent.start(make_alert(**DNS_ALERT))
+    assert "pause_monitor" in [a["action"] for a in incident["proposed_actions"]]
+
+    assert agent.close_on_recovery(MONITOR_ID, USER_ID) == [incident["id"]]
+
+    done = h.deps.incidents.get(incident["id"], USER_ID)
+    assert done["status"] == "RESOLVED"
+    assert done["results"] == []
+    assert done["decision"] == {
+        "approved": False,
+        "actions": [],
+        "approver": AUTO_RECOVERY_APPROVER,
+    }
+    assert h.monitors.docs[0]["active"] is True
+    assert h.published == []
+    log = events(h, incident["id"])
+    assert "auto_closed_on_recovery" in log and "approval_refused" not in log
+
+    with pytest.raises(InvalidIncidentState):
+        approve(agent, incident, ["pause_monitor"])
+    assert h.monitors.docs[0]["active"] is True
+
+
+def test_recovery_only_touches_that_users_monitor():
+    h = make_harness()
+    agent = agent_for(h)
+    other_monitor = agent.start(make_alert(monitorId=str(ObjectId())))
+    other_user = agent.start(make_alert(userId=OTHER_USER_ID))
+
+    assert agent.close_on_recovery(MONITOR_ID, USER_ID) == []
+    assert h.deps.incidents.get(other_monitor["id"], USER_ID)["status"] == "AWAITING_APPROVAL"
+    assert h.deps.incidents.get(other_user["id"], OTHER_USER_ID)["status"] == "AWAITING_APPROVAL"
+
+
+# ── Verifier ──────────────────────────────────────────────────────────────────
+
+
+def test_grounded_diagnosis_passes_verification():
+    h = make_harness()
+    incident = agent_for(h).start(make_alert())
+
+    assert incident["verification"] == {
+        "grounded": True,
+        "dropped_citations": [],
+        "low_confidence": False,
+    }
+    assert incident["diagnosis"]["confidence"] == 0.8
+    assert "verification" in events(h, incident["id"])
+
+
+def test_unretrieved_citation_is_dropped():
+    class PartlyHallucinating(FakeLLM):
+        def diagnose(self, alert, category, evidence, retrieved):
+            diagnosis, tokens = super().diagnose(alert, category, evidence, retrieved)
+            cited = ["imaginary.md", *diagnosis.cited_sources]
+            return diagnosis.model_copy(update={"cited_sources": cited}), tokens
+
+    h = make_harness(llm=PartlyHallucinating())
+    incident = agent_for(h).start(make_alert())
+
+    assert incident["diagnosis"]["cited_sources"] == ["server-errors-5xx.md"]
+    assert incident["diagnosis"]["confidence"] == 0.8
+    assert incident["verification"]["grounded"] is False
+    assert incident["verification"]["dropped_citations"] == ["imaginary.md"]
+    entry = next(e for e in h.deps.audit.list(incident["id"]) if e["event"] == "ungrounded_citation")
+    assert entry["data"]["sources"] == ["imaginary.md"]
+
+
+def test_ungrounded_low_confidence_diagnosis_cannot_pause():
+    h = make_harness()
+    agent = agent_for(h)
+    incident = agent.start(make_alert(monitorName="Flaky edge", **DNS_ALERT))
+
+    assert incident["diagnosis"]["cited_sources"] == []
+    assert incident["diagnosis"]["confidence"] == 0.4
+    assert incident["verification"] == {
+        "grounded": False,
+        "dropped_citations": [FakeLLM.HALLUCINATED_SOURCE],
+        "low_confidence": True,
+    }
+    assert [a["action"] for a in incident["proposed_actions"]] == ["escalate"]
+    held = [a for a in incident["rejected_actions"] if a["action"] == "pause_monitor"]
+    assert held and held[0]["reason"].startswith("low confidence")
+    assert "low_confidence" in events(h, incident["id"])
+
+    done = approve(agent, incident, ["pause_monitor", "escalate"])
+    assert [r["action"] for r in done["results"]] == ["escalate"]
+    assert h.monitors.docs[0]["active"] is True
+
+
+def test_low_confidence_pause_only_plan_falls_back_to_escalate():
+    class PauseOnly(FakeLLM):
+        def plan(self, alert, diagnosis, evidence):
+            return ActionPlan(actions=[ProposedAction(action="pause_monitor", reason="r")]), 10
+
+    h = make_harness(llm=PauseOnly())
+    incident = agent_for(h).start(make_alert(monitorName="flaky", **DNS_ALERT))
+
+    assert incident["status"] == "AWAITING_APPROVAL"
+    assert [a["action"] for a in incident["proposed_actions"]] == ["escalate"]
+    assert [a["action"] for a in incident["rejected_actions"]] == ["pause_monitor"]
+
+
+def test_no_retrieval_leaves_confidence_alone():
+    h = make_harness()
+    h.kb.search = lambda query, k=3, user_id=None: []
+    incident = agent_for(h).start(make_alert(**DNS_ALERT))
+
+    assert incident["verification"]["grounded"] is True
+    assert incident["diagnosis"]["confidence"] == 0.8
+    assert "pause_monitor" in [a["action"] for a in incident["proposed_actions"]]

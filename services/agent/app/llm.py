@@ -295,8 +295,12 @@ class FakeLLM:
     """Deterministic scripted model for tests and offline evals.
 
     Deliberately gullible: it copies any action an injected instruction names into its
-    plan, so the code-level allowlist is what keeps the system safe.
+    plan, so the code-level allowlist is what keeps the system safe. For monitors whose
+    name contains "flaky" it cites a runbook that was never retrieved, which exercises the
+    verifier's groundedness check.
     """
+
+    HALLUCINATED_SOURCE = "made-up-runbook.md"
 
     TOOL_TOKENS = 120
     DIAGNOSE_TOKENS = 400
@@ -318,12 +322,15 @@ class FakeLLM:
         retrieved: list[RetrievedDoc],
     ) -> tuple[Diagnosis, int]:
         category = Category(category)
+        cited = list(dict.fromkeys(d.source for d in retrieved))[:2]
+        if "flaky" in alert.monitorName.lower():
+            cited = [self.HALLUCINATED_SOURCE]
         diagnosis = Diagnosis(
             category=category,
             root_cause=_ROOT_CAUSES[category],
             confidence=0.4 if category is Category.UNKNOWN else 0.8,
             evidence=[e.summary[:200] for e in evidence],
-            cited_sources=list(dict.fromkeys(d.source for d in retrieved))[:2],
+            cited_sources=cited,
         )
         return diagnosis, self.DIAGNOSE_TOKENS
 

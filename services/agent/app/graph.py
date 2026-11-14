@@ -1,4 +1,4 @@
-"""The incident graph: triage → investigate → research → diagnose → plan → approve → act.
+"""The incident graph: triage → investigate → research → diagnose → verify → plan → approve → act.
 
 Orchestration is a fixed LangGraph ``StateGraph``; the model is only consulted inside the
 investigator, diagnoser and planner nodes. Every node persists the incident and writes to
@@ -11,7 +11,7 @@ import logging
 import re
 import threading
 import time
-from collections import defaultdict
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -24,6 +24,7 @@ from langgraph.types import Command, interrupt
 
 from app.config import settings
 from app.contracts import (
+    AUTO_RECOVERY_APPROVER,
     ActionName,
     ActionResult,
     AlertEvent,
@@ -35,11 +36,12 @@ from app.contracts import (
     IncidentStatus,
     ProposedAction,
     RetrievedDoc,
+    Verification,
 )
 from app.llm import LLM
 from app.security.allowlist import filter_actions, validate_approved
 from app.security.audit import AuditLog
-from app.security.budget import Budget
+from app.security.budget import Budget, BudgetExceeded
 from app.store import IncidentRepo, MonitorRepo
 from app.tools.probes import TOOL_NAMES, Probes
 
@@ -120,6 +122,7 @@ def _incident_doc(state: IncidentState) -> dict:
         "evidence": state.get("evidence", []),
         "retrieved": state.get("retrieved", []),
         "diagnosis": state.get("diagnosis"),
+        "verification": state.get("verification"),
         "proposed_actions": state.get("proposed_actions", []),
         "rejected_actions": state.get("rejected_actions", []),
         "decision": state.get("decision"),
@@ -131,6 +134,17 @@ def _incident_doc(state: IncidentState) -> dict:
 
 def _dump(items: list[Any]) -> list[dict]:
     return [i.model_dump(mode="json") for i in items]
+
+
+def _budget(state: IncidentState) -> Budget:
+    return Budget.from_settings(state.get("tool_calls", 0), state.get("tokens_used", 0))
+
+
+def _spent(exc: BaseException) -> dict[str, int]:
+    """Counters carried by a budget failure, so they outlive the node that raised."""
+    if isinstance(exc, BudgetExceeded):
+        return {"tool_calls": exc.tool_calls, "tokens_used": exc.tokens_used}
+    return {}
 
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────
@@ -157,20 +171,16 @@ class _Nodes:
                 raise
             except Exception as exc:
                 log.exception("incident %s failed in %s", state["incident_id"], name)
-                update = {"status": IncidentStatus.FAILED.value, "error": f"{name}: {exc}"}
+                update = {
+                    "status": IncidentStatus.FAILED.value,
+                    "error": f"{name}: {exc}",
+                    **_spent(exc),
+                }
                 self.audit(state, "error", node=name, error=str(exc))
             self.persist({**state, **update})
             return update
 
         return run
-
-    def budget(self, state: IncidentState) -> Budget:
-        return Budget(
-            settings.max_tool_calls,
-            settings.token_budget,
-            tool_calls=state.get("tool_calls", 0),
-            tokens_used=state.get("tokens_used", 0),
-        )
 
     def charge(self, state: IncidentState, budget: Budget, node: str, tokens: int) -> None:
         """Charge model tokens; raises ``BudgetExceeded`` (failing the incident) when over."""
@@ -190,30 +200,30 @@ class _Nodes:
         alert = AlertEvent(**state["alert"])
         category = Category(state["category"])
         evidence = [Evidence(**e) for e in state.get("evidence", [])]
-        budget = self.budget(state)
+        budget = _budget(state)
 
-        try:
-            for _ in range(settings.max_tool_calls + 1):
+        for _ in range(budget.max_tool_calls + 1):
+            if not budget.can_call_tool():
+                self.audit(state, "budget", limit="tool_calls", tool_calls=budget.tool_calls)
+                break
+            names, tokens = self.deps.llm.choose_tools(alert, category, evidence)
+            self.charge(state, budget, "investigator", tokens)
+            if not names:
+                break
+            for name in names:
+                if name not in TOOL_NAMES:
+                    self.audit(state, "unknown_tool", tool=name)
+                    continue
                 if not budget.can_call_tool():
-                    self.audit(state, "budget", limit="tool_calls", tool_calls=budget.tool_calls)
+                    self.audit(state, "budget", limit="tool_calls", skipped=name)
                     break
-                names, tokens = self.deps.llm.choose_tools(alert, category, evidence)
-                self.charge(state, budget, "investigator", tokens)
-                if not names:
-                    break
-                for name in names:
-                    if name not in TOOL_NAMES:
-                        self.audit(state, "unknown_tool", tool=name)
-                        continue
-                    if not budget.can_call_tool():
-                        self.audit(state, "budget", limit="tool_calls", skipped=name)
-                        break
-                    budget.charge_tool()
-                    evidence.append(self._run_tool(state, name, alert))
-        finally:
-            state_counts = {"tool_calls": budget.tool_calls, "tokens_used": budget.tokens_used}
-            state.update(state_counts)  # keeps counters if the loop raises
-        return {"evidence": _dump(evidence), **state_counts}
+                budget.charge_tool()
+                evidence.append(self._run_tool(state, name, alert))
+        return {
+            "evidence": _dump(evidence),
+            "tool_calls": budget.tool_calls,
+            "tokens_used": budget.tokens_used,
+        }
 
     def _run_tool(self, state: IncidentState, name: str, alert: AlertEvent) -> Evidence:
         start = time.perf_counter()
@@ -240,30 +250,65 @@ class _Nodes:
         return {"retrieved": _dump(docs)}
 
     def diagnoser(self, state: IncidentState) -> dict:
-        budget = self.budget(state)
+        budget = _budget(state)
         diagnosis, tokens = self.deps.llm.diagnose(
             AlertEvent(**state["alert"]),
             Category(state["category"]),
             [Evidence(**e) for e in state.get("evidence", [])],
             [RetrievedDoc(**d) for d in state.get("retrieved", [])],
         )
-        state["tokens_used"] = budget.tokens_used + tokens
         self.charge(state, budget, "diagnoser", tokens)
         self.audit(
             state, "diagnosis", category=diagnosis.category.value, confidence=diagnosis.confidence
         )
         return {"diagnosis": diagnosis.model_dump(mode="json"), "tokens_used": budget.tokens_used}
 
+    def verifier(self, state: IncidentState) -> dict:
+        """Drop citations the researcher never retrieved; distrust a diagnosis citing nothing.
+
+        Deterministic on purpose: the model is not asked to grade its own grounding.
+        """
+        diagnosis = Diagnosis(**state["diagnosis"])
+        retrieved = {d["source"] for d in state.get("retrieved", [])}
+        kept = [s for s in diagnosis.cited_sources if s in retrieved]
+        dropped = [s for s in diagnosis.cited_sources if s not in retrieved]
+        if dropped:
+            self.audit(state, "ungrounded_citation", sources=dropped)
+
+        confidence = diagnosis.confidence
+        if retrieved and not kept:
+            confidence = round(confidence * 0.5, 4)
+        verification = Verification(
+            grounded=not dropped and (bool(kept) or not retrieved),
+            dropped_citations=dropped,
+            low_confidence=confidence < settings.min_action_confidence,
+        )
+        self.audit(
+            state,
+            "verification",
+            **verification.model_dump(),
+            confidence=confidence,
+            original_confidence=diagnosis.confidence,
+        )
+        diagnosis = diagnosis.model_copy(update={"cited_sources": kept, "confidence": confidence})
+        return {
+            "diagnosis": diagnosis.model_dump(mode="json"),
+            "verification": verification.model_dump(mode="json"),
+        }
+
     def planner(self, state: IncidentState) -> dict:
-        budget = self.budget(state)
+        budget = _budget(state)
+        diagnosis = Diagnosis(**state["diagnosis"])
         plan, tokens = self.deps.llm.plan(
             AlertEvent(**state["alert"]),
-            Diagnosis(**state["diagnosis"]),
+            diagnosis,
             [Evidence(**e) for e in state.get("evidence", [])],
         )
-        state["tokens_used"] = budget.tokens_used + tokens
         self.charge(state, budget, "planner", tokens)
         allowed, rejected = filter_actions(plan.actions)
+        if (state.get("verification") or {}).get("low_confidence"):
+            allowed, held = self._hold_for_low_confidence(state, diagnosis, allowed)
+            rejected += held
         if rejected:
             self.audit(state, "actions_rejected", actions=_dump(rejected))
         self.audit(state, "actions_proposed", actions=[a.action for a in allowed])
@@ -272,6 +317,32 @@ class _Nodes:
             "rejected_actions": _dump(rejected),
             "tokens_used": budget.tokens_used,
         }
+
+    def _hold_for_low_confidence(
+        self, state: IncidentState, diagnosis: Diagnosis, allowed: list[ProposedAction]
+    ) -> tuple[list[ProposedAction], list[ProposedAction]]:
+        """Below the confidence floor only escalate / no_action may be proposed."""
+        safe = {ActionName.ESCALATE.value, ActionName.NO_ACTION.value}
+        keep = [a for a in allowed if a.action in safe]
+        held = [a for a in allowed if a.action not in safe]
+        if not held:
+            return keep, []
+
+        floor = settings.min_action_confidence
+        prefix = f"low confidence ({diagnosis.confidence:.2f} < {floor:.2f})"
+        held = [ProposedAction(action=a.action, reason=f"{prefix}: {a.reason}") for a in held]
+        if not keep:
+            # The model wanted to act, so a human should still hear about it.
+            reason = "Diagnosis confidence is too low to act on; the owner should review it."
+            keep = [ProposedAction(action=ActionName.ESCALATE.value, reason=reason)]
+        self.audit(
+            state,
+            "low_confidence",
+            confidence=diagnosis.confidence,
+            threshold=floor,
+            held=[a.action for a in held],
+        )
+        return keep, held
 
     def human_gate(self, state: IncidentState) -> dict:
         awaiting = {"status": IncidentStatus.AWAITING_APPROVAL.value}
@@ -377,7 +448,7 @@ def _after_planner(state: IncidentState) -> str:
 def build_graph(deps: Deps, checkpointer: BaseCheckpointSaver | None = None) -> Any:
     """Compile the incident graph with ``checkpointer`` (required for ``interrupt``)."""
     nodes = _Nodes(deps)
-    order = ["triage", "investigator", "researcher", "diagnoser", "planner"]
+    order = ["triage", "investigator", "researcher", "diagnoser", "verifier", "planner"]
     graph = StateGraph(IncidentState)
     for name in [*order, "human_gate", "executor", "reporter"]:
         graph.add_node(name, nodes.wrap(name, getattr(nodes, name)))
@@ -392,27 +463,35 @@ def build_graph(deps: Deps, checkpointer: BaseCheckpointSaver | None = None) -> 
     return graph.compile(checkpointer=checkpointer or MemorySaver())
 
 
+LOCK_STRIPES = 64
+
+INTERRUPTED_ERROR = "Interrupted by a service restart before the investigation finished"
+
+
 class IncidentAgent:
     """Runs one graph thread per alert event and resumes it on a human decision."""
 
     def __init__(self, deps: Deps, checkpointer: BaseCheckpointSaver | None = None) -> None:
         self.deps = deps
         self.graph = build_graph(deps, checkpointer)
-        self._nodes = _Nodes(deps)
-        self._guard = threading.Lock()
-        self._locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
+        # Striped rather than one lock per id so the table stays bounded; two incidents
+        # that land on the same stripe merely serialise.
+        self._locks = [threading.Lock() for _ in range(LOCK_STRIPES)]
 
     def _lock(self, incident_id: str) -> threading.Lock:
-        with self._guard:
-            return self._locks[incident_id]
+        return self._locks[zlib.crc32(incident_id.encode()) % LOCK_STRIPES]
 
     @staticmethod
     def _config(incident_id: str) -> dict:
         return {"configurable": {"thread_id": incident_id}}
 
-    def _fail(self, state: IncidentState, error: str) -> None:
-        self._nodes.audit(state, "error", error=error)
-        self._nodes.persist({**state, "status": IncidentStatus.FAILED.value, "error": error})
+    def _fail(
+        self, incident_id: str, user_id: str, error: str, exc: BaseException | None = None
+    ) -> None:
+        """Flag the incident FAILED, keeping everything the nodes already persisted."""
+        self.deps.audit.record(incident_id, user_id, "error", error=error)
+        tokens = _spent(exc).get("tokens_used") if exc else None
+        self.deps.incidents.mark_failed(incident_id, error, tokens_used=tokens)
 
     def start(self, alert: AlertEvent) -> dict:
         """Run the graph for a DOWN alert; returns the existing incident if already started."""
@@ -428,13 +507,15 @@ class IncidentAgent:
                 "tool_calls": 0,
                 "tokens_used": 0,
             }
-            self._nodes.persist(state)
-            self._nodes.audit(state, "started", monitor=alert.monitorName, url=alert.monitorUrl)
+            self.deps.incidents.upsert(_incident_doc(state))
+            self.deps.audit.record(
+                incident_id, alert.userId, "started", monitor=alert.monitorName, url=alert.monitorUrl
+            )
             try:
                 self.graph.invoke(state, self._config(incident_id))
             except Exception as exc:
                 log.exception("incident %s crashed", incident_id)
-                self._fail(state, f"graph: {exc}")
+                self._fail(incident_id, alert.userId, f"graph: {exc}", exc)
             return self.deps.incidents.get(incident_id, alert.userId) or {}
 
     def resume(self, incident_id: str, decision: ApprovalDecision) -> dict:
@@ -443,23 +524,58 @@ class IncidentAgent:
             incident = self.deps.incidents.get(incident_id, decision.approver)
             if incident is None or incident["userId"] != decision.approver:
                 raise IncidentNotFound(incident_id)
-            if incident["status"] != IncidentStatus.AWAITING_APPROVAL.value:
-                raise InvalidIncidentState(f"incident is {incident['status']}, not awaiting approval")
+            return self._resume_locked(incident, decision)
 
-            config = self._config(incident_id)
-            if "human_gate" not in self.graph.get_state(config).next:
-                state = self._state_from_doc(incident)
-                self._fail(state, "approval checkpoint is missing; the incident cannot be resumed")
-                raise InvalidIncidentState("approval checkpoint is missing")
-            try:
-                self.graph.invoke(Command(resume=decision.model_dump(mode="json")), config)
-            except Exception as exc:
-                log.exception("incident %s crashed on resume", incident_id)
-                self._fail(self._state_from_doc(incident), f"graph: {exc}")
-            return self.deps.incidents.get(incident_id, decision.approver) or {}
+    def _resume_locked(self, incident: dict, decision: ApprovalDecision) -> dict:
+        incident_id, user_id = incident["id"], incident["userId"]
+        if incident["status"] != IncidentStatus.AWAITING_APPROVAL.value:
+            raise InvalidIncidentState(f"incident is {incident['status']}, not awaiting approval")
 
-    @staticmethod
-    def _state_from_doc(doc: dict) -> IncidentState:
-        alert = {k: doc[k] for k in ("userId", "monitorId", "monitorName", "monitorUrl")}
-        state = {k: v for k, v in doc.items() if k in IncidentState.__annotations__}
-        return {**state, "incident_id": doc["id"], "alert": alert}  # type: ignore[typeddict-item]
+        config = self._config(incident_id)
+        if "human_gate" not in self.graph.get_state(config).next:
+            error = "approval checkpoint is missing; the incident cannot be resumed"
+            self._fail(incident_id, user_id, error)
+            raise InvalidIncidentState("approval checkpoint is missing")
+        try:
+            self.graph.invoke(Command(resume=decision.model_dump(mode="json")), config)
+        except Exception as exc:
+            log.exception("incident %s crashed on resume", incident_id)
+            self._fail(incident_id, user_id, f"graph: {exc}", exc)
+        return self.deps.incidents.get(incident_id, user_id) or {}
+
+    def close_on_recovery(self, monitor_id: str, user_id: str) -> list[str]:
+        """Reject every pending proposal for a monitor that is back UP; returns closed ids.
+
+        Approving later would act on a healthy monitor (e.g. pause it), so the graph is
+        resumed with a system rejection: nothing runs and the incident is RESOLVED. This
+        is the one internal path that decides without the owner. An investigation still
+        running holds the incident lock, so it is closed as soon as it reaches the gate.
+        """
+        decision = ApprovalDecision(approved=False, actions=[], approver=AUTO_RECOVERY_APPROVER)
+        closed: list[str] = []
+        for incident_id in self.deps.incidents.open_for_monitor(monitor_id, user_id):
+            with self._lock(incident_id):
+                incident = self.deps.incidents.get(incident_id, user_id)
+                if not incident or incident["status"] != IncidentStatus.AWAITING_APPROVAL.value:
+                    continue
+                self.deps.audit.record(
+                    incident_id, user_id, "auto_closed_on_recovery", monitor_id=monitor_id
+                )
+                try:
+                    self._resume_locked(incident, decision)
+                except InvalidIncidentState as exc:
+                    log.warning("could not auto-close incident %s: %s", incident_id, exc)
+                    continue
+                closed.append(incident_id)
+        return closed
+
+    def fail_interrupted(self, before: str | None = None) -> list[str]:
+        """Fail investigations orphaned by a restart; pub/sub will not redeliver their alerts.
+
+        Run once at boot, before the subscriber starts. With a single agent replica every
+        incident still INVESTIGATING and last touched before ``before`` has no live runner.
+        """
+        failed = self.deps.incidents.fail_interrupted(before or _now(), INTERRUPTED_ERROR)
+        for item in failed:
+            self.deps.audit.record(item["id"], item["userId"], "error", error=INTERRUPTED_ERROR)
+        return [item["id"] for item in failed]

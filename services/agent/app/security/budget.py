@@ -8,7 +8,16 @@ from app.config import settings
 
 
 class BudgetExceeded(Exception):
-    """An incident ran past its tool-call or token budget."""
+    """An incident ran past its tool-call or token budget.
+
+    Carries the counters at the moment of failure so the caller can persist what was
+    actually spent without reaching back into the budget object.
+    """
+
+    def __init__(self, message: str, tool_calls: int = 0, tokens_used: int = 0) -> None:
+        super().__init__(message)
+        self.tool_calls = tool_calls
+        self.tokens_used = tokens_used
 
 
 @dataclass
@@ -29,7 +38,11 @@ class Budget:
     def charge_tool(self) -> None:
         """Count one tool call; raises if the limit was already reached."""
         if not self.can_call_tool():
-            raise BudgetExceeded(f"tool call limit reached ({self.max_tool_calls})")
+            raise BudgetExceeded(
+                f"tool call limit reached ({self.max_tool_calls})",
+                tool_calls=self.tool_calls,
+                tokens_used=self.tokens_used,
+            )
         self.tool_calls += 1
 
     def charge_tokens(self, n: int) -> None:
@@ -41,7 +54,11 @@ class Budget:
             raise ValueError("token count cannot be negative")
         self.tokens_used += n
         if self.tokens_used > self.max_tokens:
-            raise BudgetExceeded(f"token budget exceeded ({self.tokens_used}/{self.max_tokens})")
+            raise BudgetExceeded(
+                f"token budget exceeded ({self.tokens_used}/{self.max_tokens})",
+                tool_calls=self.tool_calls,
+                tokens_used=self.tokens_used,
+            )
 
     @property
     def tokens_remaining(self) -> int:

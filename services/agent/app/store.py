@@ -14,6 +14,9 @@ from pymongo import MongoClient
 from pymongo.database import Database
 
 from app.config import settings
+from app.contracts import IncidentStatus
+
+_IN_FLIGHT = (IncidentStatus.INVESTIGATING.value, IncidentStatus.AWAITING_APPROVAL.value)
 
 
 @lru_cache(maxsize=1)
@@ -73,6 +76,48 @@ class IncidentRepo:
     def list(self, user_id: str) -> list[dict]:
         docs = self.collection.find({"userId": user_id}, sort=[("createdAt", -1)])
         return [self._serialise(d) for d in docs]
+
+    def mark_failed(self, incident_id: str, error: str, tokens_used: int | None = None) -> bool:
+        """Flag an in-flight incident FAILED without touching anything nodes already saved.
+
+        Finished incidents are left alone: a crash after the reporter ran does not undo it.
+        """
+        fields: dict[str, Any] = {
+            "status": IncidentStatus.FAILED.value,
+            "error": error,
+            "updatedAt": _now(),
+        }
+        if tokens_used is not None:
+            fields["tokens_used"] = tokens_used
+        result = self.collection.update_one(
+            {"_id": incident_id, "status": {"$in": list(_IN_FLIGHT)}}, {"$set": fields}
+        )
+        return result.matched_count == 1
+
+    def fail_interrupted(self, before: str, error: str) -> list[dict]:
+        """Fail investigations last touched at or before ``before`` (ISO-8601).
+
+        Returns ``[{"id", "userId"}]`` for each incident this call actually flipped.
+        """
+        query = {
+            "status": IncidentStatus.INVESTIGATING.value,
+            "updatedAt": {"$lte": before},
+        }
+        update = {
+            "$set": {"status": IncidentStatus.FAILED.value, "error": error, "updatedAt": _now()}
+        }
+        failed = []
+        for doc in self.collection.find(query, {"_id": 1, "userId": 1}):
+            # Re-check the status in the update itself so a concurrent transition wins.
+            result = self.collection.update_one({**query, "_id": doc["_id"]}, update)
+            if result.matched_count == 1:
+                failed.append({"id": str(doc["_id"]), "userId": doc.get("userId")})
+        return failed
+
+    def open_for_monitor(self, monitor_id: str, user_id: str) -> list[str]:
+        """Ids of the user's incidents on this monitor that have not finished yet."""
+        query = {"monitorId": monitor_id, "userId": user_id, "status": {"$in": list(_IN_FLIGHT)}}
+        return [str(d["_id"]) for d in self.collection.find(query, {"_id": 1})]
 
 
 class MonitorRepo:

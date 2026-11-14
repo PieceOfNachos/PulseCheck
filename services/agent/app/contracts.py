@@ -98,7 +98,19 @@ class IncidentStatus(str, Enum):
 class ApprovalDecision(BaseModel):
     approved: bool
     actions: list[str] = Field(default_factory=list)  # subset of proposed actions
-    approver: str  # userId from JWT
+    approver: str  # userId from JWT, or AUTO_RECOVERY_APPROVER
+
+
+# Approver recorded when a RECOVERED alert closes an incident still awaiting approval.
+# The decision is always a rejection, so nothing runs.
+AUTO_RECOVERY_APPROVER = "system:auto-recovery"
+
+
+# ── Verification (deterministic groundedness check between diagnoser and planner) ──
+class Verification(BaseModel):
+    grounded: bool  # every citation was retrieved, and at least one when docs were retrieved
+    dropped_citations: list[str] = Field(default_factory=list)  # cited but never retrieved
+    low_confidence: bool  # final confidence < settings.min_action_confidence
 
 
 # ── Persisted incident (Mongo collection "incidents", _id == alertEventId) ──
@@ -114,7 +126,8 @@ class IncidentDoc(BaseModel):
     category: Optional[Category] = None
     evidence: list[Evidence] = Field(default_factory=list)
     retrieved: list[RetrievedDoc] = Field(default_factory=list)
-    diagnosis: Optional[Diagnosis] = None
+    diagnosis: Optional[Diagnosis] = None  # citations and confidence as adjusted by verifier
+    verification: Optional[Verification] = None
     proposed_actions: list[ProposedAction] = Field(default_factory=list)
     rejected_actions: list[ProposedAction] = Field(default_factory=list)
     decision: Optional[ApprovalDecision] = None
@@ -133,6 +146,7 @@ class IncidentState(TypedDict, total=False):
     evidence: list[dict]  # Evidence.model_dump()
     retrieved: list[dict]  # RetrievedDoc.model_dump()
     diagnosis: dict  # Diagnosis.model_dump()
+    verification: dict  # Verification.model_dump()
     proposed_actions: list[dict]  # ProposedAction.model_dump(), already allowlist-filtered
     rejected_actions: list[dict]  # proposals dropped by the allowlist (kept for audit)
     decision: dict  # ApprovalDecision.model_dump()

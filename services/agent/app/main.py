@@ -82,11 +82,19 @@ def build_checkpointer() -> BaseCheckpointSaver:
 
 
 def handle_alert_message(agent: IncidentAgent, raw: bytes | str) -> None:
-    """Start an incident for one Redis message; never raises."""
+    """Start an incident on DOWN, close pending ones on RECOVERED; never raises."""
     try:
         alert = AlertEvent.model_validate(json.loads(raw))
     except (ValueError, ValidationError) as exc:
         log.warning("ignoring malformed alert message: %s", exc)
+        return
+    if alert.type == "RECOVERED":
+        try:
+            closed = agent.close_on_recovery(alert.monitorId, alert.userId)
+            if closed:
+                log.info("monitor %s recovered; closed %s", alert.monitorId, ", ".join(closed))
+        except Exception:
+            log.exception("closing incidents for recovered monitor %s failed", alert.monitorId)
         return
     if alert.type != "DOWN":
         return
@@ -144,6 +152,12 @@ def create_app(
         resolved = deps or build_deps()
         app.state.deps = resolved
         app.state.agent = IncidentAgent(resolved, checkpointer or build_checkpointer())
+        try:
+            interrupted = app.state.agent.fail_interrupted()
+            if interrupted:
+                log.warning("marked %d interrupted investigations failed", len(interrupted))
+        except Exception:
+            log.exception("sweeping interrupted investigations failed")
         stop = threading.Event()
         if start_subscriber:
             threading.Thread(

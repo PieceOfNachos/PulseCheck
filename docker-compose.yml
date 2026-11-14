@@ -17,7 +17,7 @@ services:
       - pulsecheck
 
   qdrant:
-    image: qdrant/qdrant:v1.12.4
+    image: qdrant/qdrant:v1.20.0
     ports:
       - "6333:6333"
     volumes:

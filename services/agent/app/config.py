@@ -27,6 +27,8 @@ class Settings:
     # Governance
     max_tool_calls: int = int(os.getenv("AGENT_MAX_TOOL_CALLS", "4"))
     token_budget: int = int(os.getenv("AGENT_TOKEN_BUDGET", "60000"))
+    # Below this (post-verification) diagnosis confidence, pause_monitor is not proposed.
+    min_action_confidence: float = float(os.getenv("AGENT_MIN_ACTION_CONFIDENCE", "0.5"))
     untrusted_max_chars: int = int(os.getenv("AGENT_UNTRUSTED_MAX_CHARS", "2048"))
     allow_private_targets: bool = os.getenv("AGENT_ALLOW_PRIVATE_TARGETS", "false") == "true"
     # Runbooks are shared across tenants, so only these user ids may upload them.

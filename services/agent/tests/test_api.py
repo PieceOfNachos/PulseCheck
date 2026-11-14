@@ -10,6 +10,8 @@ from fastapi.testclient import TestClient
 from langgraph.checkpoint.memory import MemorySaver
 
 from app.config import settings
+from app.contracts import AUTO_RECOVERY_APPROVER
+from app.graph import INTERRUPTED_ERROR
 from app.main import create_app, handle_alert_message
 from tests.agent_fakes import OTHER_USER_ID, USER_ID, make_alert, make_harness
 
@@ -129,3 +131,40 @@ def test_subscriber_handler_starts_down_alerts_only(client, harness):
 
     handle_alert_message(agent, make_alert().model_dump_json())
     assert len(harness.deps.incidents.list(USER_ID)) == 1
+
+
+def test_recovered_alert_closes_pending_incident(client, harness):
+    agent = client.app.state.agent
+    incident = agent.start(make_alert(statusCode=None, errorMessage="ENOTFOUND"))
+    assert incident["status"] == "AWAITING_APPROVAL"
+
+    handle_alert_message(agent, make_alert(type="RECOVERED").model_dump_json())
+
+    detail = client.get(f"/api/agent/incidents/{incident['id']}", headers=auth()).json()
+    assert detail["status"] == "RESOLVED"
+    assert detail["results"] == []
+    assert detail["decision"]["approver"] == AUTO_RECOVERY_APPROVER
+    assert "auto_closed_on_recovery" in [e["event"] for e in detail["audit"]]
+    assert harness.monitors.docs[0]["active"] is True
+
+    url = f"/api/agent/incidents/{incident['id']}/approve"
+    assert client.post(url, json={"actions": ["pause_monitor"]}, headers=auth()).status_code == 409
+    assert harness.monitors.docs[0]["active"] is True
+
+
+def test_startup_fails_interrupted_investigations(harness):
+    alert = make_alert()
+    harness.deps.incidents.upsert(
+        {
+            "id": alert.alertEventId,
+            "userId": USER_ID,
+            "monitorId": alert.monitorId,
+            "status": "INVESTIGATING",
+        }
+    )
+    app = create_app(deps=harness.deps, checkpointer=MemorySaver(), start_subscriber=False)
+    with TestClient(app) as c:
+        detail = c.get(f"/api/agent/incidents/{alert.alertEventId}", headers=auth()).json()
+
+    assert detail["status"] == "FAILED"
+    assert detail["error"] == INTERRUPTED_ERROR
